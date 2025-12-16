@@ -215,7 +215,9 @@ def main(
     item_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\item_info.csv",
     sample_amount = 50,
     epoch = 2,
-    lambda_retain = 0.5
+    forget_epoch = 1,
+    lambda_retain = 0.5,
+    ascent_epoch = 1
         ):
     EPOCH = epoch
 
@@ -311,7 +313,7 @@ def main(
 
     # --- aktifkan decremental ---
     cfg_C.do_decremental = True
-    cfg_C.dec_epochs = EPOCH
+    cfg_C.dec_epochs = forget_epoch
     cfg_C.dec_lr = 1e-3
     cfg_C.dec_alpha = lambda_retain
     cfg_C.dec_save_name = "dqn_decremental.pt"
@@ -334,7 +336,7 @@ def main(
     )
 
     cfg_D.do_ascent = True
-    cfg_D.asc_epochs = EPOCH
+    cfg_D.asc_epochs = ascent_epoch
 
     q_D = train_on(
         df_train_forget,
