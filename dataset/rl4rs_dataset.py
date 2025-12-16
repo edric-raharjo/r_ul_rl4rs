@@ -41,9 +41,15 @@ class RL4RSDataset9Step(Dataset):
 
         self.exclude_history_candidates = exclude_history_candidates
         self.exclude_used_candidates = exclude_used_candidates
+        
+        self.item_ids = self.df_item.index.tolist()
+        self.item_id_to_index = {iid: idx for idx, iid in enumerate(self.item_ids)}
+        self.num_items = len(self.item_ids)
 
         self.transitions: List[Dict[str, Any]] = []
         self._build_transitions(df_log)
+
+
 
     # ---------- state building ----------
 
@@ -142,6 +148,8 @@ class RL4RSDataset9Step(Dataset):
 
     # ---------- build transitions ----------
 
+        # ---------- build transitions ----------
+
     def _build_transitions(self, df_log):
         for row in df_log.itertuples(index=False):
             click_history: List[int] = getattr(row, "click_history_ids")
@@ -151,8 +159,22 @@ class RL4RSDataset9Step(Dataset):
             if len(exposed_ids) != self.slate_size or len(labels) != self.slate_size:
                 continue
 
+            # rewards per slot (3-3-3 gating)
             rewards = self._compute_rewards_3_3_3_weighted(labels)
+
+            # candidate item vectors for this slate [K, D]
             slate_vecs = self._slate_candidate_vecs(exposed_ids)  # [9, D]
+
+            # candidate item indices for this slate [K]
+            # if an exposed_id is unknown, map to a dummy index (e.g., num_items-1 or 0)
+            candidate_ids = []
+            for iid in exposed_ids:
+                if iid in self.item_id_to_index:
+                    candidate_ids.append(self.item_id_to_index[iid])
+                else:
+                    # fallback: map unknown items to a special index 0
+                    candidate_ids.append(0)
+            candidate_ids = np.array(candidate_ids, dtype=np.int64)  # [9]
 
             history_ids = list(click_history)
             used_ids: List[int] = []
@@ -176,7 +198,13 @@ class RL4RSDataset9Step(Dataset):
                 else:
                     state_vec = hist_emb
 
-                # ----- action item_vec (item pada slot k dari log) -----
+                # ----- action id (discrete item index) -----
+                if item_id in self.item_id_to_index:
+                    action_index = self.item_id_to_index[item_id]
+                else:
+                    action_index = 0  # same dummy index as above
+
+                # (optional) still keep item_vec if you need it elsewhere
                 if item_id in self.df_item.index:
                     item_vec = self.df_item.loc[item_id, "item_vec_array"]
                 else:
@@ -186,8 +214,7 @@ class RL4RSDataset9Step(Dataset):
                 history_ids.append(item_id)
                 used_ids.append(item_id)
 
-                # ----- update tier counters: gunakan valid_purchase -----
-                # reward_k > 0 berarti label==1 dan tier unlocked
+                # ----- update tier counters -----
                 if reward_k > 0.0:
                     if slot_idx <= 3:
                         bought_tier1 += 1
@@ -210,19 +237,26 @@ class RL4RSDataset9Step(Dataset):
 
                 # ----- next candidates & mask -----
                 next_candidate_item_vecs = slate_vecs.copy()  # [9, D]
-                next_candidate_mask = self._build_candidate_mask(exposed_ids, history_ids, used_ids)  # [9]
+                next_candidate_mask = self._build_candidate_mask(
+                    exposed_ids, history_ids, used_ids
+                )  # [9]
                 next_candidate_labels = np.array(labels, dtype=np.float32)  # [9]
+
+                # candidate IDs stay the same for this log row (same slate)
+                next_candidate_ids = candidate_ids.copy()  # [9]
 
                 # ----- store transition -----
                 self.transitions.append({
                     "state": torch.from_numpy(state_vec).float(),
-                    "item_vec": torch.from_numpy(item_vec).float(),
+                    "item_vec": torch.from_numpy(item_vec).float(),  # optional
+                    "action_id": torch.tensor(action_index, dtype=torch.long),
                     "reward": torch.tensor(reward_k, dtype=torch.float32),
                     "done": torch.tensor(done, dtype=torch.float32),
                     "next_state": torch.from_numpy(next_state_vec).float(),
                     "next_candidate_item_vecs": torch.from_numpy(next_candidate_item_vecs).float(),
                     "next_candidate_mask": torch.from_numpy(next_candidate_mask),
                     "next_candidate_labels": torch.from_numpy(next_candidate_labels).float(),
+                    "next_candidate_ids": torch.from_numpy(next_candidate_ids).long(),  # [9]
                 })
 
     # ---------- Dataset API ----------

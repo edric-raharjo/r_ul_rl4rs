@@ -41,35 +41,37 @@ class TrainConfig:
     do_ascent: bool = False
     asc_epochs: int = 3
 
-
 def train_one_epoch(q, q_target, loader, optimizer, criterion, cfg: TrainConfig, global_step: int):
     q.train()
     running_loss = 0.0
 
     for i, batch in enumerate(loader):
-        state = batch["state"].to(cfg.device)
-        action_item_vec = batch["item_vec"].to(cfg.device)
+        state = batch["state"].to(cfg.device)                 # [B, state_dim]
+        action_id = batch["action_id"].to(cfg.device).long()  # [B]
         reward = batch["reward"].to(cfg.device)
         done = batch["done"].to(cfg.device)
         next_state = batch["next_state"].to(cfg.device)
 
-        next_cand_vecs = batch["next_candidate_item_vecs"].to(cfg.device)
-        next_cand_mask = batch["next_candidate_mask"].to(cfg.device).bool()
+        next_cand_ids = batch["next_candidate_ids"].to(cfg.device).long()        # [B, K]
+        next_cand_mask = batch["next_candidate_mask"].to(cfg.device).bool()      # [B, K]
 
-        q_sa = q(state, action_item_vec)
+        # current Q(s,a)
+        q_all = q(state)                             # [B, num_items]
+        q_sa = q_all.gather(1, action_id.unsqueeze(1)).squeeze(1)  # [B]
 
+        # target Q on next state
         with torch.no_grad():
             q_next_all = q_target.q_values_for_candidates(
                 state=next_state,
-                candidate_item_vecs=next_cand_vecs,
-                candidate_mask=next_cand_mask
-            )
-            q_next_max, _ = q_next_all.max(dim=1)
+                candidate_ids=next_cand_ids,
+                candidate_mask=next_cand_mask,
+            )                                        # [B, K]
+            q_next_max, _ = q_next_all.max(dim=1)    # [B]
 
         loss = criterion(q_sa=q_sa, r=reward, done=done, q_next_max=q_next_max)
 
         if cfg.do_ascent:
-            loss = -loss  # maximize the Q-values
+            loss = -loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -97,127 +99,36 @@ def train_one_epoch(q, q_target, loader, optimizer, criterion, cfg: TrainConfig,
 
     return global_step
 
-def decremental_unlearn(q, forget_loader: DataLoader, cfg: TrainConfig):
-    """
-    Reinforcement Unlearning dengan random action exploration:
-    
-    1. Agent pilih action RANDOM dari kandidat yang valid.
-    2. Compute Q_random = Q(s, a_random).
-    3. Compute Q_policy = Q_ref(s, a_greedy) dari policy lama (greedy).
-    4. Update Q dengan loss: |Q_random| + alpha * |Q_random - Q_policy|.
-    
-    Paper: "Reinforcement Unlearning" by Dayong Ye et al.
-    """
-    import copy
-    from model.loss_function import RandomPolicyUnlearnLoss
-    from torch.optim import Adam
-
-    device = cfg.device
-
-    # frozen reference model (policy lama)
-    q_ref = copy.deepcopy(q).to(device)
-    q_ref.eval()
-    for p in q_ref.parameters():
-        p.requires_grad_(False)
-
-    q.train()
-    for p in q.parameters():
-        p.requires_grad_(True)
-
-    unlearn_opt = Adam(q.parameters(), lr=cfg.dec_lr)
-    unlearn_loss = RandomPolicyUnlearnLoss(alpha=cfg.dec_alpha, reduction="mean")
-
-    global_step = 0
-    for epoch in range(cfg.dec_epochs):
-        running = 0.0
-        
-        for i, batch in enumerate(forget_loader):
-            state = batch["state"].to(device)
-            cand_vecs = batch["next_candidate_item_vecs"].to(device)
-            cand_mask = batch["next_candidate_mask"].to(device).bool()
-
-            B, K, D = cand_vecs.shape
-
-            # ===== STEP 1: RANDOM ACTION =====
-            random_actions = []
-            for b in range(B):
-                valid_indices = torch.where(cand_mask[b])[0]
-                if len(valid_indices) > 0:
-                    rand_idx = valid_indices[torch.randint(len(valid_indices), (1,))].item()
-                else:
-                    rand_idx = 0
-                random_actions.append(rand_idx)
-            
-            random_actions = torch.tensor(random_actions, device=device)  # [B]
-
-            # ===== STEP 2: Q_random (model sekarang, action random) =====
-            random_action_vecs = cand_vecs[torch.arange(B), random_actions, :]  # [B, D]
-            q_random = q(state, random_action_vecs)  # [B]
-
-            # ===== STEP 3: Q_policy (policy lama, action greedy) =====
-            with torch.no_grad():
-                # Compute Q untuk semua kandidat pakai policy lama
-                q_ref_all_list = []
-                for k in range(K):
-                    q_ref_all_list.append(q_ref(state, cand_vecs[:, k, :]))
-                q_ref_all = torch.stack(q_ref_all_list, dim=1)  # [B, K]
-                q_ref_all = torch.where(cand_mask, q_ref_all, torch.full_like(q_ref_all, float("-inf")))
-                
-                # Greedy action dari policy lama
-                greedy_actions = q_ref_all.argmax(dim=1)  # [B]
-                greedy_action_vecs = cand_vecs[torch.arange(B), greedy_actions, :]  # [B, D]
-                q_policy = q_ref(state, greedy_action_vecs)  # [B]
-
-            # ===== STEP 4: LOSS =====
-            loss, stats = unlearn_loss(q_random=q_random, q_policy=q_policy)
-
-            if global_step == 0:
-                print(f"[DEBUG] Random actions: {random_actions[:5].tolist()}")
-                print(f"[DEBUG] Greedy actions (ref): {greedy_actions[:5].tolist()}")
-                print(f"[DEBUG] Q_random: {q_random[:5].tolist()}")
-                print(f"[DEBUG] Q_policy: {q_policy[:5].tolist()}")
-                print(f"[DEBUG] loss.requires_grad={loss.requires_grad}")
-
-            unlearn_opt.zero_grad()
-            loss.backward()
-
-            if cfg.grad_clip is not None and cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(q.parameters(), cfg.grad_clip)
-
-            unlearn_opt.step()
-
-            running += float(loss.item())
-            if (global_step % cfg.dec_log_interval) == 0:
-                avg = running / max(1, (i + 1))
-                print(f"[DEC epoch {epoch+1}/{cfg.dec_epochs} step {global_step}] "
-                      f"loss={stats['loss_total']:.6f} avg={avg:.6f} | "
-                      f"mag={stats['loss_magnitude']:.6f} diff={stats['loss_diff']:.6f}")
-            global_step += 1
-
-    return q
-
-
 def train_dqn_basic(train_loader: DataLoader,
                     state_dim: int,
-                    item_dim: int,
+                    num_items: int,                 # <-- was item_dim
                     hidden_dim: int = 256,
                     cfg: TrainConfig = TrainConfig(),
-                    forget_loader: Optional[DataLoader] = None):
+                    forget_loader: Optional[DataLoader] = None,
+                    retain_loader: Optional[DataLoader] = None):
     # networks
-    q, q_target = create_q_networks(state_dim=state_dim, item_dim=item_dim,
-                                    hidden_dim=hidden_dim, device=cfg.device)
+    q, q_target = create_q_networks(
+        state_dim=state_dim,
+        num_items=num_items,    
+        hidden_dim=hidden_dim,
+        device=cfg.device,
+    )
 
     optimizer = Adam(q.parameters(), lr=cfg.lr)
     criterion = DQNLoss(gamma=cfg.gamma, loss_type="huber", reduction="mean")
 
+    # handle ascent flag
+    enable_later = False
     if cfg.do_ascent:
-        cfg.do_ascent = False # disable for now
+        cfg.do_ascent = False  # disable during base training
         enable_later = True
 
     global_step = 0
     for epoch in range(cfg.num_epochs):
         print(f"\n=== Epoch {epoch+1}/{cfg.num_epochs} ===")
-        global_step = train_one_epoch(q, q_target, train_loader, optimizer, criterion, cfg, global_step)
+        global_step = train_one_epoch(
+            q, q_target, train_loader, optimizer, criterion, cfg, global_step
+        )
 
     # save base model
     save_model(q, cfg.save_dir, cfg.save_name)
@@ -225,26 +136,132 @@ def train_dqn_basic(train_loader: DataLoader,
 
     # optional decremental unlearning
     if cfg.do_decremental:
-        if forget_loader is None:
-            raise ValueError("cfg.do_decremental=True but forget_loader is None")
+        if forget_loader is None or retain_loader is None:
+            raise ValueError("Need both forget_loader and retain_loader for decremental RL")
 
-        print("\n=== Decremental RL (unlearning) on forget_loader ===")
-        q = decremental_unlearn(q, forget_loader, cfg)
+        print("\n=== Decremental RL (Eq.12-13) on forget/retain loaders ===")
+        q = decremental_unlearn_eq12_13(q, forget_loader, retain_loader, cfg, lambda_retain=cfg.dec_alpha)
 
-        save_model(q, cfg.save_dir, cfg.dec_save_name)
-        print(f"Saved decremental model to {os.path.join(cfg.save_dir, cfg.dec_save_name)}")
-    
     elif enable_later:
+        # re-enable ascent only after base training
         cfg.do_ascent = True
-        
+
         if forget_loader is None:
             raise ValueError("cfg.do_ascent=True but forget_loader is None")
 
         for epoch in range(cfg.asc_epochs):
-            print(f"\n=== Ascent RL (unlearning) Epoch {epoch+1}/{cfg.dec_epochs} on forget_loader ===")
-            global_step = train_one_epoch(q, q_target, forget_loader, optimizer, criterion, cfg, global_step)
+            print(f"\n=== Ascent RL (unlearning) Epoch {epoch+1}/{cfg.asc_epochs} on forget_loader ===")
+            global_step = train_one_epoch(
+                q, q_target, forget_loader, optimizer, criterion, cfg, global_step
+            )
 
         save_model(q, cfg.save_dir, cfg.dec_save_name)
         print(f"Saved ascent model to {os.path.join(cfg.save_dir, cfg.dec_save_name)}")
+
+    return q
+
+import copy
+import torch
+from torch.utils.data import DataLoader
+from torch.optim import Adam
+
+
+def decremental_unlearn_eq12_13(
+    q,
+    forget_loader: DataLoader,
+    retain_loader: DataLoader,
+    cfg: TrainConfig,
+    lambda_retain: float = 1.0,
+):
+    """
+    Decremental RL (Ye et al.) for catalog-style DQN, implementing Eq. 12 & 13.
+
+    - Forget loss (Eq. 12):   L_forget  = E_{(s,a)~tau_u} [ Q_cur(s,a) ]
+    - Retain loss (Eq. 13):   L_retain  = E_{(s,a) !~tau_u} | Q_cur(s,a) - Q_ref(s,a) |
+    - Total:                  L_dec     = L_forget + lambda_retain * L_retain
+    """
+
+    device = cfg.device
+
+    # ---- 1. Frozen reference network Q_ref = Q_theta ----
+    q_ref = copy.deepcopy(q).to(device)
+    q_ref.eval()
+    for p in q_ref.parameters():
+        p.requires_grad_(False)
+
+    # ---- 2. Trainable network Q_cur = Q_theta' ----
+    q.train()
+    for p in q.parameters():
+        p.requires_grad_(True)
+
+    opt = Adam(q.parameters(), lr=cfg.dec_lr)
+
+    # simple iterator cycling over retain_loader
+    retain_iter = iter(retain_loader)
+
+    global_step = 0
+    for epoch in range(cfg.dec_epochs):
+        running = 0.0
+
+        for i, batch_f in enumerate(forget_loader):
+            # -------------------------
+            # FORGET BATCH  (Eq. 12)
+            # -------------------------
+            s_f = batch_f["state"].to(device)          # [B_f, state_dim]
+            a_f = batch_f["action_id"].to(device).long()  # [B_f]
+
+            q_all_f = q(s_f)                           # [B_f, num_items]
+            q_forget = q_all_f.gather(1, a_f.unsqueeze(1)).squeeze(1)  # [B_f]
+
+            # Eq. 12: minimize reward along tau_u -> push Q down
+            L_forget = q_forget.mean()
+
+            # -------------------------
+            # RETAIN BATCH (Eq. 13)
+            # -------------------------
+            try:
+                batch_r = next(retain_iter)
+            except StopIteration:
+                retain_iter = iter(retain_loader)
+                batch_r = next(retain_iter)
+
+            s_r = batch_r["state"].to(device)          # [B_r, state_dim]
+            a_r = batch_r["action_id"].to(device).long()
+
+            # current Q on retain data
+            q_all_r_cur = q(s_r)                       # [B_r, num_items]
+            q_retain_cur = q_all_r_cur.gather(1, a_r.unsqueeze(1)).squeeze(1)  # [B_r]
+
+            # reference Q on retain data (no grad)
+            with torch.no_grad():
+                q_all_r_ref = q_ref(s_r)               # [B_r, num_items]
+                q_retain_ref = q_all_r_ref.gather(1, a_r.unsqueeze(1)).squeeze(1)  # [B_r]
+
+            # Eq. 13: keep new Q close to old Q on retain trajectories
+            L_retain = torch.abs(q_retain_cur - q_retain_ref).mean()
+
+            # -------------------------
+            # TOTAL DECREMENTAL LOSS
+            # -------------------------
+            loss = L_forget + lambda_retain * L_retain
+
+            opt.zero_grad()
+            loss.backward()
+
+            if cfg.grad_clip is not None and cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(q.parameters(), cfg.grad_clip)
+
+            opt.step()
+
+            running += float(loss.item())
+            if (global_step % cfg.dec_log_interval) == 0:
+                avg = running / max(1, (i + 1))
+                print(
+                    f"[DEC-EQ12_13 epoch {epoch+1}/{cfg.dec_epochs} "
+                    f"step {global_step}] loss={loss.item():.6f} avg={avg:.6f} "
+                    f"| L_forget={L_forget.item():.6f} L_retain={L_retain.item():.6f}"
+                )
+
+            global_step += 1
 
     return q

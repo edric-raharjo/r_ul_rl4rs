@@ -4,7 +4,6 @@ from typing import Literal, Optional
 import torch
 import torch.nn as nn
 
-
 class DQNLoss(nn.Module):
     """
     Basic DQN loss:
@@ -63,54 +62,69 @@ class DQNLoss(nn.Module):
 """ 
 a. Decremental RL
 """
-from typing import Literal
+
 import torch
 import torch.nn as nn
+from typing import Literal, Dict, Tuple
+
 
 class RandomPolicyUnlearnLoss(nn.Module):
     """
-    Loss untuk unlearning dengan random action exploration:
-    
-    L = E[ |Q_random(s, a_rand)| ] + alpha * E[ |Q_random(s, a_rand) - Q_policy(s, a_greedy)| ]
-    
-    - Q_random: Q dari model yang sedang di-unlearn untuk action random.
-    - Q_policy: Q dari model reference (policy sebelum unlearning) untuk action greedy.
-    - alpha: weight untuk regularizer (jaga jangan terlalu jauh dari policy lama).
+    Random-Policy Decremental RL loss (Ye et al., Reinforcement Unlearning).
+
+    Inputs:
+        q_random: Q_cur(s, a_rand) from CURRENT model on random valid actions [B]
+        q_policy: Q_ref(s, a_greedy_ref) from FROZEN reference model on its greedy actions [B]
+
+    Loss (per batch):
+        L_mag  = E[ |q_random| ]
+        L_diff = E[ |q_random - q_policy| ]
+        L_tot  = L_mag + alpha * L_diff
+
+    - L_mag  pushes Q on random actions in forget states toward 0
+    - L_diff keeps the new Q surface close to the old policy's Q on those states
     """
-    
-    def __init__(self, alpha: float = 1.0, reduction: Literal["mean", "sum"] = "mean"):
+
+    def __init__(
+        self,
+        alpha: float = 0.5,
+        reduction: Literal["mean", "sum"] = "mean",
+    ):
         super().__init__()
-        self.alpha = float(alpha)
+        self.alpha = alpha
         self.reduction = reduction
-    
-    def _reduce(self, x: torch.Tensor) -> torch.Tensor:
+
+    def forward(
+        self,
+        q_random: torch.Tensor,   # [B]
+        q_policy: torch.Tensor,   # [B]
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+
+        q_random = q_random.float()
+        q_policy = q_policy.float()
+
+        # magnitude term: make random actions low-value
+        loss_mag = torch.abs(q_random)
+
+        # consistency term: keep close to reference policy Q
+        loss_diff = torch.abs(q_random - q_policy)
+
         if self.reduction == "mean":
-            return x.mean()
+            loss_mag = loss_mag.mean()
+            loss_diff = loss_diff.mean()
         elif self.reduction == "sum":
-            return x.sum()
+            loss_mag = loss_mag.sum()
+            loss_diff = loss_diff.sum()
         else:
             raise ValueError("reduction must be 'mean' or 'sum'")
-    
-    def forward(self,
-                q_random: torch.Tensor,      # [B] Q untuk action random
-                q_policy: torch.Tensor       # [B] Q untuk action greedy dari policy lama
-                ) -> tuple[torch.Tensor, dict]:
-        
-        q_random = q_random.float()
-        q_policy = q_policy.float().detach()  # frozen
-        
-        # Term 1: minimize magnitude Q random action
-        loss_mag = self._reduce(torch.abs(q_random))
-        
-        # Term 2: minimize difference (regularizer)
-        loss_diff = self._reduce(torch.abs(q_random - q_policy))
-        
+
         loss_total = loss_mag + self.alpha * loss_diff
-        
+
         stats = {
-            "loss_total": float(loss_total.detach().cpu()),
-            "loss_magnitude": float(loss_mag.detach().cpu()),
-            "loss_diff": float(loss_diff.detach().cpu()),
-            "alpha": float(self.alpha),
+            "loss_total": float(loss_total.detach().cpu().item()),
+            "loss_magnitude": float(loss_mag.detach().cpu().item()),
+            "loss_diff": float(loss_diff.detach().cpu().item()),
         }
+
         return loss_total, stats
+

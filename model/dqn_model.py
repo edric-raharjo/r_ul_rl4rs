@@ -1,11 +1,10 @@
 # model/dqn_model.py
-import os
-from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Tuple, Optional
+import os
 
 class StateEncoder(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int):
@@ -18,45 +17,67 @@ class StateEncoder(nn.Module):
         x = F.relu(self.fc2(x))
         return x
 
-class QNetwork(nn.Module):
-    def __init__(self, state_dim: int, item_dim: int, hidden_dim: int = 256):
+class CatalogQNetwork(nn.Module):
+    """
+    State -> Q-values over a fixed catalog of items (discrete actions).
+
+    - num_items: total number of discrete item IDs (action space size)
+    - forward(state): returns [B, num_items] Q(s, a) for all a
+    """
+
+    def __init__(self, state_dim: int, num_items: int, hidden_dim: int = 256):
         super().__init__()
         self.state_encoder = StateEncoder(state_dim, hidden_dim)
-        self.fc_q1 = nn.Linear(hidden_dim + item_dim, hidden_dim)
-        self.fc_q2 = nn.Linear(hidden_dim, 1)
+        self.fc_q = nn.Linear(hidden_dim, num_items)
+        self.num_items = num_items
 
-    def forward(self, state: torch.Tensor, item_vec: torch.Tensor) -> torch.Tensor:
-        s_emb = self.state_encoder(state)
-        x = torch.cat([s_emb, item_vec], dim=-1)
-        x = F.relu(self.fc_q1(x))
-        q = self.fc_q2(x).squeeze(-1)
-        return q
-
-    @torch.no_grad()
-    def q_values_for_candidates(self,
-                               state: torch.Tensor,
-                               candidate_item_vecs: torch.Tensor,
-                               candidate_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, K, _ = candidate_item_vecs.shape
-        state_rep = state.unsqueeze(1).expand(-1, K, -1)
-        q_flat = self.forward(
-            state_rep.reshape(B * K, -1),
-            candidate_item_vecs.reshape(B * K, -1)
-        )
-        q_all = q_flat.reshape(B, K)
-        if candidate_mask is not None:
-            q_all = q_all.masked_fill(~candidate_mask, float("-inf"))
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        state: [B, state_dim]
+        returns: q_all [B, num_items]
+        """
+        s_emb = self.state_encoder(state)      # [B, H]
+        q_all = self.fc_q(s_emb)              # [B, num_items]
         return q_all
 
-def create_q_networks(state_dim: int,
-                    item_dim: int,
-                    hidden_dim: int = 256,
-                    device: str = "cuda") -> Tuple[QNetwork, QNetwork]:
-    q = QNetwork(state_dim, item_dim, hidden_dim).to(device)
-    q_target = QNetwork(state_dim, item_dim, hidden_dim).to(device)
+    @torch.no_grad()
+    def q_values_for_candidates(
+        self,
+        state: torch.Tensor,                  # [B, state_dim]
+        candidate_ids: torch.Tensor,          # [B, K] int64 indices into catalog
+        candidate_mask: Optional[torch.Tensor] = None,  # [B, K] bool
+    ) -> torch.Tensor:
+        """
+        Convenience: get Q(s, a) for a set of candidate item IDs.
+
+        - state: [B, state_dim]
+        - candidate_ids: [B, K] (each entry in [0, num_items-1])
+        - candidate_mask: optional [B, K] bool; False -> invalid -> -inf
+        returns: q_all [B, K]
+        """
+        B, K = candidate_ids.shape
+
+        q_catalog = self.forward(state)       # [B, num_items]
+        # gather Q for each candidate ID
+        q_all = q_catalog.gather(1, candidate_ids)  # [B, K]
+
+        if candidate_mask is not None:
+            q_all = q_all.masked_fill(~candidate_mask, float("-inf"))
+
+        return q_all
+
+def create_q_networks(
+    state_dim: int,
+    num_items: int,
+    hidden_dim: int = 256,
+    device: str = "cuda",
+) -> Tuple[CatalogQNetwork, CatalogQNetwork]:
+    q = CatalogQNetwork(state_dim, num_items, hidden_dim).to(device)
+    q_target = CatalogQNetwork(state_dim, num_items, hidden_dim).to(device)
     q_target.load_state_dict(q.state_dict())
     q_target.eval()
     return q, q_target
+
 
 def soft_update(target_net: nn.Module, source_net: nn.Module, tau: float = 0.005):
     for target_param, param in zip(target_net.parameters(), source_net.parameters()):

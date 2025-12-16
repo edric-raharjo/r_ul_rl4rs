@@ -1,4 +1,5 @@
 import numpy as np
+import os
 import torch
 from torch.utils.data import DataLoader
 import pandas as pd
@@ -43,30 +44,37 @@ def make_dataset(df_log_part, df_item):
         exclude_history_candidates=True
     )
 
-
-def train_on(df_log_train, df_item, cfg, forget_loader=None):
+def train_on(df_log_train, df_item, cfg, forget_loader=None, retain_loader=None):
     ds = make_dataset(df_log_train, df_item)
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    loader = DataLoader(
+        ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
 
     sample0 = ds[0]
     state_dim = sample0["state"].numel()
-    item_dim = sample0["item_vec"].numel()
+    num_items = ds.num_items  # from RL4RSDataset9Step
 
     q = train_dqn_basic(
         train_loader=loader,
         state_dim=state_dim,
-        item_dim=item_dim,
+        num_items=num_items,
         hidden_dim=256,
         cfg=cfg,
-        forget_loader=forget_loader  # <-- NEW: untuk decremental RL
+        forget_loader=forget_loader,  # for decremental RL
+        retain_loader=retain_loader,  # for decremental RL
     )
     return q
+
 
 
 def create_results_folder(trial_name):
     """Create a timestamped results folder with subfolders"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_folder = f"{trial_name}_{timestamp}"
+    results_folder = f"results/{trial_name}_{timestamp}"
     
     base_path = Path(results_folder)
     base_path.mkdir(exist_ok=True)
@@ -211,17 +219,26 @@ def main(
     df_log = load_log_table(log_cfg).reset_index(drop=True)
     df_item = load_item_table(item_cfg)
 
-    df_log = df_log.iloc[:3000].reset_index(drop=True)
+    df_log = df_log.iloc[:50].reset_index(drop=True)
 
-    df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.5, 0.25, 0.25, seed=42)
+    df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.6, 0.2, 0.2, seed=42)
     df_train_forget = pd.concat([df_train, df_forget]).reset_index(drop=True)
 
     test_ds = make_dataset(df_test, df_item)
     forget_ds = make_dataset(df_forget, df_item)
+    train_ds = make_dataset(df_train, df_item)
 
     # Loader untuk forget (dipakai saat decremental/unlearning)
     forget_loader = DataLoader(
         forget_ds,
+        batch_size=256,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    retain_loader = DataLoader(
+        train_ds,
         batch_size=256,
         shuffle=True,
         num_workers=4,
@@ -268,6 +285,7 @@ def main(
     all_metrics.append(flatten_metrics_to_csv_row(metrics_B["trial"], metrics_B["test"], metrics_B["forget"]))
 
     # B_alt: trained on retain + forget (basic)
+    cfg.save_name = "dqn_basic_retain_forget.pt"
     q_B_rf = train_on(df_train_forget, df_item, cfg)
     metrics_B_rf = eval_report("B (trained on retain+forget)", q_B_rf, test_ds, forget_ds, cfg.device)
     all_metrics.append(flatten_metrics_to_csv_row(metrics_B_rf["trial"], metrics_B_rf["test"], metrics_B_rf["forget"]))
@@ -292,7 +310,7 @@ def main(
     cfg_C.dec_alpha = 0.5
     cfg_C.dec_save_name = "dqn_decremental.pt"
 
-    q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader)
+    q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader, retain_loader=retain_loader)
     metrics_C = eval_report("C (basic + decremental)", q_C, test_ds, forget_ds, cfg.device)
     all_metrics.append(flatten_metrics_to_csv_row(metrics_C["trial"], metrics_C["test"], metrics_C["forget"]))
 
