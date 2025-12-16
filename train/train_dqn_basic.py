@@ -210,6 +210,10 @@ def train_dqn_basic(train_loader: DataLoader,
     optimizer = Adam(q.parameters(), lr=cfg.lr)
     criterion = DQNLoss(gamma=cfg.gamma, loss_type="huber", reduction="mean")
 
+    if cfg.do_ascent:
+        cfg.do_ascent = False # disable for now
+        enable_later = True
+
     global_step = 0
     for epoch in range(cfg.num_epochs):
         print(f"\n=== Epoch {epoch+1}/{cfg.num_epochs} ===")
@@ -230,7 +234,9 @@ def train_dqn_basic(train_loader: DataLoader,
         save_model(q, cfg.save_dir, cfg.dec_save_name)
         print(f"Saved decremental model to {os.path.join(cfg.save_dir, cfg.dec_save_name)}")
     
-    elif cfg.do_ascent:
+    elif enable_later:
+        cfg.do_ascent = True
+        
         if forget_loader is None:
             raise ValueError("cfg.do_ascent=True but forget_loader is None")
 

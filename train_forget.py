@@ -203,7 +203,7 @@ def main(
     log_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\trainset.csv",
     item_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\item_info.csv"
         ):
-    EPOCH = 3
+    EPOCH = 2
 
     log_cfg = LogConfig(path=log_path, slate_size=9, max_click_history=50)
     item_cfg = ItemConfig(path=item_path, item_vec_dim=None)
@@ -211,7 +211,7 @@ def main(
     df_log = load_log_table(log_cfg).reset_index(drop=True)
     df_item = load_item_table(item_cfg)
 
-    df_log = df_log.iloc[:1200].reset_index(drop=True)
+    df_log = df_log.iloc[:3000].reset_index(drop=True)
 
     df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.5, 0.25, 0.25, seed=42)
     df_train_forget = pd.concat([df_train, df_forget]).reset_index(drop=True)
@@ -287,9 +287,9 @@ def main(
 
     # --- aktifkan decremental ---
     cfg_C.do_decremental = True
-    cfg_C.dec_epochs = EPOCH + 3
+    cfg_C.dec_epochs = EPOCH
     cfg_C.dec_lr = 1e-3
-    cfg_C.dec_alpha = 0.45
+    cfg_C.dec_alpha = 0.5
     cfg_C.dec_save_name = "dqn_decremental.pt"
 
     q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader)
@@ -310,7 +310,7 @@ def main(
     )
 
     cfg_D.do_ascent = True
-    cfg_D.asc_epochs = EPOCH + 3
+    cfg_D.asc_epochs = EPOCH
 
     q_D = train_on(df_train_forget, df_item, cfg_D, forget_loader=forget_loader)
     metrics_D = eval_report("D (retain+forget + ascent)", q_D, test_ds, forget_ds, cfg.device)
