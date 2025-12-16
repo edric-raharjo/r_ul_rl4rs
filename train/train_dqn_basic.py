@@ -149,7 +149,7 @@ def train_dqn_basic(train_loader: DataLoader,
             raise ValueError("Need both forget_loader and retain_loader for decremental RL")
 
         print("\n=== Decremental RL (Eq.12-13) on forget/retain loaders ===")
-        q = decremental_unlearn_eq12_13(q, forget_loader, retain_loader, cfg, lambda_retain=cfg.dec_alpha)
+        q = decremental_unlearn(q, forget_loader, retain_loader, cfg, lambda_retain=cfg.dec_alpha)
 
     elif enable_later:
         # re-enable ascent only after base training

@@ -312,7 +312,7 @@ def main(
     cfg_C.do_decremental = True
     cfg_C.dec_epochs = EPOCH
     cfg_C.dec_lr = 1e-3
-    cfg_C.dec_alpha = 0.5
+    cfg_C.dec_alpha = 1.0
     cfg_C.dec_save_name = "dqn_decremental.pt"
 
     q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader, retain_loader=retain_loader, do_base_train=False, pretrained_path="weights/dqn_basic_retain_forget.pt")
