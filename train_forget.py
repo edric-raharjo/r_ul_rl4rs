@@ -44,7 +44,7 @@ def make_dataset(df_log_part, df_item):
         exclude_history_candidates=True
     )
 
-def train_on(df_log_train, df_item, cfg, forget_loader=None, retain_loader=None):
+def train_on(df_log_train, df_item, cfg, forget_loader=None, retain_loader=None, do_base_train=True, pretrained_path=None):
     ds = make_dataset(df_log_train, df_item)
     loader = DataLoader(
         ds,
@@ -66,6 +66,8 @@ def train_on(df_log_train, df_item, cfg, forget_loader=None, retain_loader=None)
         cfg=cfg,
         forget_loader=forget_loader,  # for decremental RL
         retain_loader=retain_loader,  # for decremental RL
+        do_base_train=do_base_train,
+        pretrained_path=pretrained_path
     )
     return q
 
@@ -209,9 +211,11 @@ def create_plots(results_folder, metrics_list):
 
 def main(
     log_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\trainset.csv",
-    item_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\item_info.csv"
+    item_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\item_info.csv",
+    sample_amount = 50,
+    epoch = 2
         ):
-    EPOCH = 2
+    EPOCH = epoch
 
     log_cfg = LogConfig(path=log_path, slate_size=9, max_click_history=50)
     item_cfg = ItemConfig(path=item_path, item_vec_dim=None)
@@ -219,7 +223,7 @@ def main(
     df_log = load_log_table(log_cfg).reset_index(drop=True)
     df_item = load_item_table(item_cfg)
 
-    df_log = df_log.iloc[:50].reset_index(drop=True)
+    df_log = df_log.iloc[:sample_amount].reset_index(drop=True)
 
     df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.6, 0.2, 0.2, seed=42)
     df_train_forget = pd.concat([df_train, df_forget]).reset_index(drop=True)
@@ -310,7 +314,7 @@ def main(
     cfg_C.dec_alpha = 0.5
     cfg_C.dec_save_name = "dqn_decremental.pt"
 
-    q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader, retain_loader=retain_loader)
+    q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader, retain_loader=retain_loader, do_base_train=False, pretrained_path="weights/dqn_basic_retain_forget.pt")
     metrics_C = eval_report("C (basic + decremental)", q_C, test_ds, forget_ds, cfg.device)
     all_metrics.append(flatten_metrics_to_csv_row(metrics_C["trial"], metrics_C["test"], metrics_C["forget"]))
 
@@ -324,13 +328,20 @@ def main(
         target_update=cfg.target_update,
         hard_update_interval=cfg.hard_update_interval,
         save_dir=cfg.save_dir,
-        save_name="dqn_basic_then_dec.pt"
+        save_name="dqn_basic_then_dec.pt",
     )
 
     cfg_D.do_ascent = True
     cfg_D.asc_epochs = EPOCH
 
-    q_D = train_on(df_train_forget, df_item, cfg_D, forget_loader=forget_loader)
+    q_D = train_on(
+        df_train_forget,
+        df_item,
+        cfg_D,
+        forget_loader=forget_loader,
+        do_base_train=False,                # <--- skip base training
+        pretrained_path="weights/dqn_basic_retain_forget.pt",     # <--- start from B
+    )
     metrics_D = eval_report("D (retain+forget + ascent)", q_D, test_ds, forget_ds, cfg.device)
     all_metrics.append(flatten_metrics_to_csv_row(metrics_D["trial"], metrics_D["test"], metrics_D["forget"]))
 

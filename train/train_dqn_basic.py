@@ -105,7 +105,9 @@ def train_dqn_basic(train_loader: DataLoader,
                     hidden_dim: int = 256,
                     cfg: TrainConfig = TrainConfig(),
                     forget_loader: Optional[DataLoader] = None,
-                    retain_loader: Optional[DataLoader] = None):
+                    retain_loader: Optional[DataLoader] = None,
+                    do_base_train: bool = True,
+                    pretrained_path: Optional[str] = None):
     # networks
     q, q_target = create_q_networks(
         state_dim=state_dim,
@@ -113,6 +115,11 @@ def train_dqn_basic(train_loader: DataLoader,
         hidden_dim=hidden_dim,
         device=cfg.device,
     )
+
+    if pretrained_path is not None:
+        q.load_state_dict(torch.load(pretrained_path, map_location=cfg.device))
+        q_target.load_state_dict(q.state_dict())
+        print(f"Loaded pretrained model from {pretrained_path}")
 
     optimizer = Adam(q.parameters(), lr=cfg.lr)
     criterion = DQNLoss(gamma=cfg.gamma, loss_type="huber", reduction="mean")
@@ -122,17 +129,19 @@ def train_dqn_basic(train_loader: DataLoader,
     if cfg.do_ascent:
         cfg.do_ascent = False  # disable during base training
         enable_later = True
-
+        
     global_step = 0
-    for epoch in range(cfg.num_epochs):
-        print(f"\n=== Epoch {epoch+1}/{cfg.num_epochs} ===")
-        global_step = train_one_epoch(
-            q, q_target, train_loader, optimizer, criterion, cfg, global_step
-        )
 
-    # save base model
-    save_model(q, cfg.save_dir, cfg.save_name)
-    print(f"Saved model to {os.path.join(cfg.save_dir, cfg.save_name)}")
+    if do_base_train:
+        for epoch in range(cfg.num_epochs):
+            print(f"\n=== Epoch {epoch+1}/{cfg.num_epochs} ===")
+            global_step = train_one_epoch(
+                q, q_target, train_loader, optimizer, criterion, cfg, global_step
+            )
+
+        # save base model
+        save_model(q, cfg.save_dir, cfg.save_name)
+        print(f"Saved model to {os.path.join(cfg.save_dir, cfg.save_name)}")
 
     # optional decremental unlearning
     if cfg.do_decremental:
