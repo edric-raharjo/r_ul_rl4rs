@@ -129,7 +129,7 @@ def train_dqn_basic(train_loader: DataLoader,
     if cfg.do_ascent:
         cfg.do_ascent = False  # disable during base training
         enable_later = True
-        
+
     global_step = 0
 
     if do_base_train:
@@ -174,38 +174,55 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 
+import copy
+import torch
+from torch.utils.data import DataLoader
+from torch.optim import Adam
 
-def decremental_unlearn_eq12_13(
+import copy
+import torch
+from torch.utils.data import DataLoader
+from torch.optim import Adam
+
+
+def decremental_unlearn(
     q,
-    forget_loader: DataLoader,
-    retain_loader: DataLoader,
+    forget_loader: DataLoader,   # must contain: state, next_candidate_ids, next_candidate_mask
+    retain_loader: DataLoader,   # must contain: state, action_id
     cfg: TrainConfig,
     lambda_retain: float = 1.0,
 ):
     """
-    Decremental RL (Ye et al.) for catalog-style DQN, implementing Eq. 12 & 13.
+    Decremental RL for catalog-style DQN with in-loop randomization on forget states.
 
-    - Forget loss (Eq. 12):   L_forget  = E_{(s,a)~tau_u} [ Q_cur(s,a) ]
-    - Retain loss (Eq. 13):   L_retain  = E_{(s,a) !~tau_u} | Q_cur(s,a) - Q_ref(s,a) |
-    - Total:                  L_dec     = L_forget + lambda_retain * L_retain
+    Forget side (approx Eq.12, random policy on tau_u):
+        - For each forget state s, sample random valid action a_rand from its slate.
+        - L_forget = E_s [ Q_cur(s, a_rand) ]
+
+    Retain side (Eq.13 on non-forget trajectories):
+        - For (s,a) ~ retain buffer, preserve Q:
+          L_retain = E_{(s,a)} | Q_cur(s,a) - Q_ref(s,a) |
+
+    Total:
+        L_dec = L_forget + lambda_retain * L_retain
     """
 
     device = cfg.device
 
-    # ---- 1. Frozen reference network Q_ref = Q_theta ----
+    # ---- 1. Frozen reference network Q_ref = Q_θ ----
     q_ref = copy.deepcopy(q).to(device)
     q_ref.eval()
     for p in q_ref.parameters():
         p.requires_grad_(False)
 
-    # ---- 2. Trainable network Q_cur = Q_theta' ----
+    # ---- 2. Trainable network Q_cur = Q_θ' ----
     q.train()
     for p in q.parameters():
         p.requires_grad_(True)
 
     opt = Adam(q.parameters(), lr=cfg.dec_lr)
 
-    # simple iterator cycling over retain_loader
+    # iterator over retain loader (cycled)
     retain_iter = iter(retain_loader)
 
     global_step = 0
@@ -213,45 +230,62 @@ def decremental_unlearn_eq12_13(
         running = 0.0
 
         for i, batch_f in enumerate(forget_loader):
-            # -------------------------
-            # FORGET BATCH  (Eq. 12)
-            # -------------------------
-            s_f = batch_f["state"].to(device)          # [B_f, state_dim]
-            a_f = batch_f["action_id"].to(device).long()  # [B_f]
+            # =================================================
+            #  FORGET BATCH: random policy on candidate slate
+            # =================================================
+            state_f = batch_f["state"].to(device)                     # [B_f, state_dim]
+            cand_ids_f = batch_f["next_candidate_ids"].to(device).long()   # [B_f, K]
+            cand_mask_f = batch_f["next_candidate_mask"].to(device).bool() # [B_f, K]
 
-            q_all_f = q(s_f)                           # [B_f, num_items]
-            q_forget = q_all_f.gather(1, a_f.unsqueeze(1)).squeeze(1)  # [B_f]
+            B_f, K = cand_ids_f.shape
 
-            # Eq. 12: minimize reward along tau_u -> push Q down
+            # sample random valid index per state
+            rand_idx = []
+            for b in range(B_f):
+                valid = torch.where(cand_mask_f[b])[0]
+                if len(valid) > 0:
+                    idx = valid[torch.randint(len(valid), (1,))].item()
+                else:
+                    idx = 0
+                rand_idx.append(idx)
+            rand_idx = torch.tensor(rand_idx, device=device, dtype=torch.long)   # [B_f]
+
+            # corresponding random item ids
+            rand_item_ids = cand_ids_f[torch.arange(B_f, device=device), rand_idx]   # [B_f]
+
+            # Q_cur(s, ·) and Q_cur(s, a_rand)
+            q_all_f = q(state_f)                                 # [B_f, num_items]
+            q_forget = q_all_f.gather(1, rand_item_ids.unsqueeze(1)).squeeze(1)  # [B_f]
+
+            # Eq.12-like: minimize expected Q on random-policy forget trajectories
             L_forget = q_forget.mean()
 
-            # -------------------------
-            # RETAIN BATCH (Eq. 13)
-            # -------------------------
+            # =================================================
+            #  RETAIN BATCH: preserve Q per Eq.13
+            # =================================================
             try:
                 batch_r = next(retain_iter)
             except StopIteration:
                 retain_iter = iter(retain_loader)
                 batch_r = next(retain_iter)
 
-            s_r = batch_r["state"].to(device)          # [B_r, state_dim]
-            a_r = batch_r["action_id"].to(device).long()
+            state_r = batch_r["state"].to(device)                  # [B_r, state_dim]
+            action_r = batch_r["action_id"].to(device).long()      # [B_r]
 
             # current Q on retain data
-            q_all_r_cur = q(s_r)                       # [B_r, num_items]
-            q_retain_cur = q_all_r_cur.gather(1, a_r.unsqueeze(1)).squeeze(1)  # [B_r]
+            q_all_r_cur = q(state_r)                               # [B_r, num_items]
+            q_retain_cur = q_all_r_cur.gather(1, action_r.unsqueeze(1)).squeeze(1)  # [B_r]
 
-            # reference Q on retain data (no grad)
+            # reference Q on retain data
             with torch.no_grad():
-                q_all_r_ref = q_ref(s_r)               # [B_r, num_items]
-                q_retain_ref = q_all_r_ref.gather(1, a_r.unsqueeze(1)).squeeze(1)  # [B_r]
+                q_all_r_ref = q_ref(state_r)                       # [B_r, num_items]
+                q_retain_ref = q_all_r_ref.gather(1, action_r.unsqueeze(1)).squeeze(1)  # [B_r]
 
-            # Eq. 13: keep new Q close to old Q on retain trajectories
             L_retain = torch.abs(q_retain_cur - q_retain_ref).mean()
 
-            # -------------------------
-            # TOTAL DECREMENTAL LOSS
-            # -------------------------
+            # =================================================
+            #  TOTAL LOSS
+            # =================================================
             loss = L_forget + lambda_retain * L_retain
 
             opt.zero_grad()
@@ -266,9 +300,9 @@ def decremental_unlearn_eq12_13(
             if (global_step % cfg.dec_log_interval) == 0:
                 avg = running / max(1, (i + 1))
                 print(
-                    f"[DEC-EQ12_13 epoch {epoch+1}/{cfg.dec_epochs} "
-                    f"step {global_step}] loss={loss.item():.6f} avg={avg:.6f} "
-                    f"| L_forget={L_forget.item():.6f} L_retain={L_retain.item():.6f}"
+                    f"[DEC epoch {epoch+1}/{cfg.dec_epochs} step {global_step}] "
+                    f"loss={loss.item():.6f} avg={avg:.6f} | "
+                    f"L_forget={L_forget.item():.6f} L_retain={L_retain.item():.6f}"
                 )
 
             global_step += 1

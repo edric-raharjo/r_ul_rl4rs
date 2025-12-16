@@ -76,7 +76,8 @@ def train_on(df_log_train, df_item, cfg, forget_loader=None, retain_loader=None,
 def create_results_folder(trial_name):
     """Create a timestamped results folder with subfolders"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_folder = f"results/{trial_name}_{timestamp}"
+
+    results_folder = f"{trial_name}_{timestamp}"
     
     base_path = Path(results_folder)
     base_path.mkdir(exist_ok=True)
