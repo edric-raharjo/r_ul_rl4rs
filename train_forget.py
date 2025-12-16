@@ -199,10 +199,11 @@ def create_plots(results_folder, metrics_list):
     return plot_path
 
 
-def main():
-    EPOCH = 3
-    log_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\trainset.csv"
+def main(
+    log_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\trainset.csv",
     item_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\item_info.csv"
+        ):
+    EPOCH = 3
 
     log_cfg = LogConfig(path=log_path, slate_size=9, max_click_history=50)
     item_cfg = ItemConfig(path=item_path, item_vec_dim=None)
