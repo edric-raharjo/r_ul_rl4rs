@@ -37,6 +37,10 @@ class TrainConfig:
     dec_log_interval: int = 50
     dec_save_name: str = "dqn_decremental.pt"
 
+    # ---- ascent RL (unlearning) ----
+    do_ascent: bool = False
+    asc_epochs: int = 3
+
 
 def train_one_epoch(q, q_target, loader, optimizer, criterion, cfg: TrainConfig, global_step: int):
     q.train()
@@ -64,6 +68,9 @@ def train_one_epoch(q, q_target, loader, optimizer, criterion, cfg: TrainConfig,
 
         loss = criterion(q_sa=q_sa, r=reward, done=done, q_next_max=q_next_max)
 
+        if cfg.do_ascent:
+            loss = -loss  # maximize the Q-values
+
         optimizer.zero_grad()
         loss.backward()
 
@@ -90,26 +97,6 @@ def train_one_epoch(q, q_target, loader, optimizer, criterion, cfg: TrainConfig,
 
     return global_step
 
-
-@torch.no_grad()
-def _get_forget_q_vectors_no_grad(model, batch, device):
-    state = batch["state"].to(device)
-    cand_vecs = batch["next_candidate_item_vecs"].to(device)
-    cand_mask = batch["next_candidate_mask"].to(device).bool()
-
-    q_vec = model.q_values_for_candidates(state, cand_vecs, cand_mask)  # [B,K]
-    q_vec = torch.where(cand_mask, q_vec, torch.zeros_like(q_vec))
-    return q_vec, cand_mask
-
-def _get_forget_q_vectors_with_grad(model, batch, device):
-    state = batch["state"].to(device)
-    cand_vecs = batch["next_candidate_item_vecs"].to(device)
-    cand_mask = batch["next_candidate_mask"].to(device).bool()
-
-    q_vec = model.q_values_for_candidates(state, cand_vecs, cand_mask)  # [B,K]
-    # invalid -> 0 supaya tidak ada -inf yang bikin abs/max aneh
-    q_vec = torch.where(cand_mask, q_vec, torch.zeros_like(q_vec))
-    return q_vec, cand_mask
 def decremental_unlearn(q, forget_loader: DataLoader, cfg: TrainConfig):
     """
     Reinforcement Unlearning dengan random action exploration:
@@ -242,5 +229,16 @@ def train_dqn_basic(train_loader: DataLoader,
 
         save_model(q, cfg.save_dir, cfg.dec_save_name)
         print(f"Saved decremental model to {os.path.join(cfg.save_dir, cfg.dec_save_name)}")
+    
+    elif cfg.do_ascent:
+        if forget_loader is None:
+            raise ValueError("cfg.do_ascent=True but forget_loader is None")
+
+        for epoch in range(cfg.asc_epochs):
+            print(f"\n=== Ascent RL (unlearning) Epoch {epoch+1}/{cfg.dec_epochs} on forget_loader ===")
+            global_step = train_one_epoch(q, q_target, forget_loader, optimizer, criterion, cfg, global_step)
+
+        save_model(q, cfg.save_dir, cfg.dec_save_name)
+        print(f"Saved ascent model to {os.path.join(cfg.save_dir, cfg.dec_save_name)}")
 
     return q

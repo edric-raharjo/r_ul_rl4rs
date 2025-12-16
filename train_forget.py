@@ -1,6 +1,11 @@
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+from datetime import datetime
+from pathlib import Path
 
 from utils.data_loader import LogConfig, ItemConfig, load_log_table, load_item_table
 from dataset.rl4rs_dataset import RL4RSDataset9Step
@@ -58,10 +63,140 @@ def train_on(df_log_train, df_item, cfg, forget_loader=None):
     return q
 
 
+def create_results_folder(trial_name):
+    """Create a timestamped results folder with subfolders"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_folder = f"{trial_name}_{timestamp}"
+    
+    base_path = Path(results_folder)
+    base_path.mkdir(exist_ok=True)
+    
+    # Create subfolders
+    (base_path / "csv").mkdir(exist_ok=True)
+    (base_path / "plots").mkdir(exist_ok=True)
+    
+    return str(base_path)
+
+
 def eval_report(tag, model, test_ds, forget_ds, device, ks=(1, 3, 5, 9)):
+    """Evaluate and return results as dict for logging"""
     print(f"\n=== {tag} ===")
-    print("Test:", evaluate(model, test_ds, device=device, ks=ks))
-    print("Forget:", evaluate(model, forget_ds, device=device, ks=ks))
+    test_metrics = evaluate(model, test_ds, device=device, ks=ks)
+    forget_metrics = evaluate(model, forget_ds, device=device, ks=ks)
+    
+    print("Test:", test_metrics)
+    print("Forget:", forget_metrics)
+    
+    return {
+        "trial": tag,
+        "test": test_metrics,
+        "forget": forget_metrics
+    }
+
+
+def flatten_metrics_to_csv_row(trial_name, test_metrics, forget_metrics):
+    """Flatten nested metrics dict into a single CSV row"""
+    row = {"trial": trial_name}
+    
+    # Flatten test metrics
+    for key, value in test_metrics.items():
+        row[f"test_{key}"] = value
+    
+    # Flatten forget metrics
+    for key, value in forget_metrics.items():
+        row[f"forget_{key}"] = value
+    
+    return row
+
+
+def save_metrics_to_csv(results_folder, metrics_list):
+    """Save all metrics to a CSV file"""
+    df = pd.DataFrame(metrics_list)
+    csv_path = Path(results_folder) / "csv" / "metrics.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nMetrics saved to {csv_path}")
+    return csv_path
+
+
+def create_plots(results_folder, metrics_list):
+    """Create and save comparison plots"""
+    df = pd.DataFrame(metrics_list)
+    
+    plots_folder = Path(results_folder) / "plots"
+    
+    # Extract metrics (assuming NDCG@k, HR@k format)
+    trials = df["trial"].tolist()
+    
+    # Find all metric columns
+    test_cols = [col for col in df.columns if col.startswith("test_")]
+    forget_cols = [col for col in df.columns if col.startswith("forget_")]
+    
+    # Create comparison plots
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Model Evaluation Metrics Comparison", fontsize=16, fontweight='bold')
+    
+    # Plot 1: Test metrics across trials
+    if test_cols:
+        ax = axes[0, 0]
+        for col in test_cols[:4]:  # Limit to first 4 metrics
+            ax.plot(trials, df[col], marker='o', label=col)
+        ax.set_title("Test Metrics")
+        ax.set_xlabel("Trial")
+        ax.set_ylabel("Score")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    # Plot 2: Forget metrics across trials
+    if forget_cols:
+        ax = axes[0, 1]
+        for col in forget_cols[:4]:  # Limit to first 4 metrics
+            ax.plot(trials, df[col], marker='s', label=col)
+        ax.set_title("Forget Metrics")
+        ax.set_xlabel("Trial")
+        ax.set_ylabel("Score")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    # Plot 3: Test vs Forget comparison for first metric
+    if test_cols and forget_cols:
+        ax = axes[1, 0]
+        test_metric = test_cols[0]
+        forget_metric = forget_cols[0]
+        x = np.arange(len(trials))
+        width = 0.35
+        ax.bar(x - width/2, df[test_metric], width, label='Test', alpha=0.8)
+        ax.bar(x + width/2, df[forget_metric], width, label='Forget', alpha=0.8)
+        ax.set_title(f"Test vs Forget: {test_metric}")
+        ax.set_xlabel("Trial")
+        ax.set_ylabel("Score")
+        ax.set_xticks(x)
+        ax.set_xticklabels(trials, rotation=45, ha='right')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 4: Summary statistics
+    ax = axes[1, 1]
+    ax.axis('off')
+    
+    summary_text = "Summary Statistics:\n\n"
+    for col in test_cols[:3]:
+        mean_val = df[col].mean()
+        std_val = df[col].std()
+        summary_text += f"{col}:\n  Mean: {mean_val:.4f}, Std: {std_val:.4f}\n"
+    
+    ax.text(0.1, 0.9, summary_text, transform=ax.transAxes, fontsize=10, 
+            verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plot_path = plots_folder / "metrics_comparison.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    print(f"Plots saved to {plot_path}")
+    plt.close()
+    
+    return plot_path
 
 
 def main():
@@ -75,9 +210,10 @@ def main():
     df_log = load_log_table(log_cfg).reset_index(drop=True)
     df_item = load_item_table(item_cfg)
 
-    df_log = df_log.iloc[:200].reset_index(drop=True)
+    df_log = df_log.iloc[:1200].reset_index(drop=True)
 
-    df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.6, 0.2, 0.2, seed=42)
+    df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.5, 0.25, 0.25, seed=42)
+    df_train_forget = pd.concat([df_train, df_forget]).reset_index(drop=True)
 
     test_ds = make_dataset(df_test, df_item)
     forget_ds = make_dataset(df_forget, df_item)
@@ -103,6 +239,15 @@ def main():
         save_name="dqn_basic.pt"
     )
 
+    # Create results folder
+    results_folder = create_results_folder("RL4RS_Unlearning")
+    print(f"\n{'='*60}")
+    print(f"Results will be saved to: {results_folder}")
+    print(f"{'='*60}")
+    
+    # Store all results
+    all_metrics = []
+
     # A: untrained baseline (optional)
     # try:
     #     cfg_A = TrainConfig(
@@ -116,9 +261,15 @@ def main():
     # except Exception as e:
     #     print("\n(A untrained diskip) train_dqn_basic tidak support num_epochs=0:", repr(e))
 
-    # B: trained (basic)
+    # B: trained on retain only (basic)
     q_B = train_on(df_train, df_item, cfg)
-    eval_report("B (trained)", q_B, test_ds, forget_ds, cfg.device)
+    metrics_B = eval_report("A (trained on retain)", q_B, test_ds, forget_ds, cfg.device)
+    all_metrics.append(flatten_metrics_to_csv_row(metrics_B["trial"], metrics_B["test"], metrics_B["forget"]))
+
+    # B_alt: trained on retain + forget (basic)
+    q_B_rf = train_on(df_train_forget, df_item, cfg)
+    metrics_B_rf = eval_report("B (trained on retain+forget)", q_B_rf, test_ds, forget_ds, cfg.device)
+    all_metrics.append(flatten_metrics_to_csv_row(metrics_B_rf["trial"], metrics_B_rf["test"], metrics_B_rf["forget"]))
 
     # C: trained + decremental RL unlearning on forget
     cfg_C = TrainConfig(
@@ -135,45 +286,46 @@ def main():
 
     # --- aktifkan decremental ---
     cfg_C.do_decremental = True
-    cfg_C.dec_epochs = EPOCH
+    cfg_C.dec_epochs = EPOCH + 3
     cfg_C.dec_lr = 1e-3
     cfg_C.dec_alpha = 0.45
     cfg_C.dec_save_name = "dqn_decremental.pt"
 
-    q_C = train_on(df_train, df_item, cfg_C, forget_loader=forget_loader)
-    eval_report("C (basic + decremental)", q_C, test_ds, forget_ds, cfg.device)
+    q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader)
+    metrics_C = eval_report("C (basic + decremental)", q_C, test_ds, forget_ds, cfg.device)
+    all_metrics.append(flatten_metrics_to_csv_row(metrics_C["trial"], metrics_C["test"], metrics_C["forget"]))
 
-    @torch.no_grad()
-    def compute_avg_q_forget(model, forget_ds, device):
-        loader = DataLoader(forget_ds, batch_size=256, shuffle=False)
-        q_vals = []
-        for batch in loader:
-            state = batch["state"].to(device)
-            cand_vecs = batch["next_candidate_item_vecs"].to(device)
-            cand_mask = batch["next_candidate_mask"].to(device).bool()
-            # manual forward (atau pakai q_values_for_candidates kalau sudah fix grad)
-            B, K, D = cand_vecs.shape
-            qs = []
-            for k in range(K):
-                qs.append(model(state, cand_vecs[:, k, :]))
-            q_vec = torch.stack(qs, dim=1)
-            q_vec = torch.where(cand_mask, q_vec, torch.zeros_like(q_vec))
-            q_vals.append(q_vec.mean().item())
-        return float(np.mean(q_vals))
+    # D: Learn with retain and forget, then gradient ascent on forget
+    cfg_D = TrainConfig(
+        device=cfg.device,
+        lr=cfg.lr,
+        gamma=cfg.gamma,
+        batch_size=cfg.batch_size,
+        num_epochs=cfg.num_epochs,
+        target_update=cfg.target_update,
+        hard_update_interval=cfg.hard_update_interval,
+        save_dir=cfg.save_dir,
+        save_name="dqn_basic_then_dec.pt"
+    )
 
-    # RETAIN SET TESTING
-    # Sebelum decremental:
-    avg_q_test_before = compute_avg_q_forget(q_B, test_ds, cfg.device)
-    # Setelah decremental:
-    avg_q_test_after = compute_avg_q_forget(q_C, test_ds, cfg.device)
-    print(f"Avg Q retain: before={avg_q_test_before:.4f}, after={avg_q_test_after:.4f}")
+    cfg_D.do_ascent = True
+    cfg_D.asc_epochs = EPOCH + 3
+
+    q_D = train_on(df_train_forget, df_item, cfg_D, forget_loader=forget_loader)
+    metrics_D = eval_report("D (retain+forget + ascent)", q_D, test_ds, forget_ds, cfg.device)
+    all_metrics.append(flatten_metrics_to_csv_row(metrics_D["trial"], metrics_D["test"], metrics_D["forget"]))
+
+    # Save metrics to CSV
+    save_metrics_to_csv(results_folder, all_metrics)
     
-    # FORGET SET TESTING
-    # Sebelum decremental:
-    avg_q_before = compute_avg_q_forget(q_B, forget_ds, cfg.device)
-    # Setelah decremental:
-    avg_q_after = compute_avg_q_forget(q_C, forget_ds, cfg.device)
-    print(f"Avg Q forget: before={avg_q_before:.4f}, after={avg_q_after:.4f}")
+    # Create and save plots
+    create_plots(results_folder, all_metrics)
+    
+    print(f"\n{'='*60}")
+    print(f"All results saved to: {results_folder}")
+    print(f"  - CSV: {results_folder}/csv/metrics.csv")
+    print(f"  - Plots: {results_folder}/plots/metrics_comparison.png")
+    print(f"{'='*60}")
 
 
 

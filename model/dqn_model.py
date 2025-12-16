@@ -5,7 +5,7 @@ from typing import Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from typing import Optional
 
 class StateEncoder(nn.Module):
     def __init__(self, state_dim: int, hidden_dim: int):
@@ -17,11 +17,6 @@ class StateEncoder(nn.Module):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         return x
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
 
 class QNetwork(nn.Module):
     def __init__(self, state_dim: int, item_dim: int, hidden_dim: int = 256):
@@ -53,8 +48,6 @@ class QNetwork(nn.Module):
             q_all = q_all.masked_fill(~candidate_mask, float("-inf"))
         return q_all
 
-
-
 def create_q_networks(state_dim: int,
                     item_dim: int,
                     hidden_dim: int = 256,
@@ -65,20 +58,16 @@ def create_q_networks(state_dim: int,
     q_target.eval()
     return q, q_target
 
-
 def soft_update(target_net: nn.Module, source_net: nn.Module, tau: float = 0.005):
     for target_param, param in zip(target_net.parameters(), source_net.parameters()):
         target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
-
 def hard_update(target_net: nn.Module, source_net: nn.Module):
     target_net.load_state_dict(source_net.state_dict())
-
 
 def save_model(model: nn.Module, save_dir: str, filename: str):
     os.makedirs(save_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_dir, filename))
-
 
 def load_model(model: nn.Module, save_dir: str, filename: str, map_location: str = "cpu"):
     model.load_state_dict(torch.load(os.path.join(save_dir, filename), map_location=map_location))

@@ -18,7 +18,7 @@ class LogConfig:
 @dataclass
 class ItemConfig:
     path: str
-    item_vec_dim: int = 4         # contoh dari screenshot "2,2,1,0.015..."
+    item_vec_dim: int = 6         # contoh dari screenshot "2,2,1,0.015..."
                                   # nanti bisa kamu set otomatis
 
 
@@ -51,9 +51,23 @@ def load_item_table(cfg: ItemConfig) -> pd.DataFrame:
 
     # parse item_vec menjadi array float
     def _parse_vec(s: str) -> np.ndarray:
-        return np.asarray(parse_float_seq(s), dtype=np.float32)
-
+        s_parsed = parse_float_seq(s)
+        return np.asarray(s_parsed, dtype=np.float32)
+    
+    # Apply the _parse_vec
     df_item["item_vec_array"] = df_item["item_vec"].apply(_parse_vec)
+
+    # Add df_item["Price"] to the item_vec_array
+    def _append_price_to_vec(row: pd.Series) -> np.ndarray:
+        vec = row["item_vec_array"]
+        price = float(row["price"])
+        return np.concatenate([vec, np.array([price], dtype=np.float32)])
+    
+    # Normalize the price before appending (optional)
+    max_price = df_item["price"].max()
+    df_item["price"] = df_item["price"] / max_price
+    
+    df_item["item_vec_array"] = df_item.apply(_append_price_to_vec, axis=1)
 
     # opsional: deteksi dimensi otomatis
     if "item_vec_dim" in cfg.__dict__ and cfg.item_vec_dim is None:
