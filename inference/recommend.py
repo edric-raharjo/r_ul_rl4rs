@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 # pastikan QNetwork kamu punya method q_values_for_candidates
-from model.dqn_model import QNetwork
+from scripts.model.dqn_agent import sQNetwork
 
 
 def build_history_embedding(history_item_ids: List[int],

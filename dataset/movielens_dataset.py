@@ -221,18 +221,26 @@ class MovieLensDataset(Dataset):
                 })
     
     
-    def _encode_state(self, history: List[Dict]) -> np.ndarray:
-        """Encode state: [item_idx_1, rating_1, item_idx_2, rating_2, ...]"""
+    def _encode_state(self, history: List[Dict], max_history: int = 50) -> np.ndarray:
+        """
+        Fixed-size state: always returns array of length (max_history * 2)
+        """
         if len(history) == 0:
-            return np.zeros(2, dtype=np.float32)
+            return np.zeros(max_history * 2, dtype=np.float32)
+        
+        # Only use last max_history items
+        recent = history[-max_history:]
         
         state = []
-        for h in history:
+        for h in recent:
             state.extend([float(h['item_idx']), float(h['rating'])])
         
-        return np.array(state, dtype=np.float32)
-    
-    
+        # Pad to EXACTLY max_history * 2
+        while len(state) < max_history * 2:
+            state.insert(0, 0.0)
+        
+        return np.array(state[:max_history * 2], dtype=np.float32)  # Ensure exact size
+
     def __len__(self) -> int:
         return len(self.transitions)
     

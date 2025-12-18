@@ -1,367 +1,313 @@
-import numpy as np
-import os
+# train/train_forget.py
 import torch
-from torch.utils.data import DataLoader
-import pandas as pd
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Subset
+from dataset.movielens_dataset import MovieLensDataset
+from model.dqn_agent import DQNAgent
+from model.dqn_model import QNetwork
+from eval.evaluate import (
+    evaluate_recommender,
+    print_evaluation_results,
+    compute_unlearning_summary,
+    print_unlearning_summary
+)
+from tqdm import tqdm
+import numpy as np
+import copy
+from typing import List, Dict, Tuple
 import os
-from datetime import datetime
-from pathlib import Path
-
-from utils.data_loader import LogConfig, ItemConfig, load_log_table, load_item_table
-from dataset.rl4rs_dataset import RL4RSDataset9Step
-from train.train_dqn_basic import train_dqn_basic, TrainConfig
-from eval.evaluate import evaluate
+import json
 
 
-def split_df_log_train_forget_test(df_log, train_ratio=0.6, forget_ratio=0.2, test_ratio=0.2, seed=42):
-    assert abs(train_ratio + forget_ratio + test_ratio - 1.0) < 1e-9
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(df_log))
-    rng.shuffle(idx)
-
-    n_train = int(len(df_log) * train_ratio)
-    n_forget = int(len(df_log) * forget_ratio)
-
-    train_idx = idx[:n_train]
-    forget_idx = idx[n_train:n_train + n_forget]
-    test_idx = idx[n_train + n_forget:]
-
-    return (
-        df_log.iloc[train_idx].reset_index(drop=True),
-        df_log.iloc[forget_idx].reset_index(drop=True),
-        df_log.iloc[test_idx].reset_index(drop=True),
+def split_dataset(
+    dataset: MovieLensDataset,
+    forget_user_ids: List[int],
+    test_ratio: float = 0.2
+) -> Tuple[List[int], List[int], List[int]]:
+    """Split dataset into Retain, Forget, and Test sets."""
+    all_user_ids = dataset.user_ids
+    retain_user_ids = [uid for uid in all_user_ids if uid not in forget_user_ids]
+    
+    forget_transitions = []
+    for uid in forget_user_ids:
+        forget_transitions.extend(dataset.get_user_transitions(uid))
+    
+    retain_transitions = []
+    for uid in retain_user_ids:
+        retain_transitions.extend(dataset.get_user_transitions(uid))
+    
+    np.random.shuffle(retain_transitions)
+    np.random.shuffle(forget_transitions)
+    
+    retain_test_size = int(len(retain_transitions) * test_ratio)
+    forget_test_size = int(len(forget_transitions) * test_ratio)
+    
+    test_indices = (
+        retain_transitions[:retain_test_size] + 
+        forget_transitions[:forget_test_size]
     )
-
-
-def make_dataset(df_log_part, df_item):
-    return RL4RSDataset9Step(
-        df_log=df_log_part,
-        df_item=df_item,
-        slate_size=9,
-        use_tier_flags=True,
-        tier_weights=(1.0, 2.0, 4.0),
-        exclude_history_candidates=True
-    )
-
-def train_on(df_log_train, df_item, cfg, forget_loader=None, retain_loader=None, do_base_train=True, pretrained_path=None):
-    ds = make_dataset(df_log_train, df_item)
-    loader = DataLoader(
-        ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-    )
-
-    sample0 = ds[0]
-    state_dim = sample0["state"].numel()
-    num_items = ds.num_items  # from RL4RSDataset9Step
-
-    q = train_dqn_basic(
-        train_loader=loader,
-        state_dim=state_dim,
-        num_items=num_items,
-        hidden_dim=256,
-        cfg=cfg,
-        forget_loader=forget_loader,  # for decremental RL
-        retain_loader=retain_loader,  # for decremental RL
-        do_base_train=do_base_train,
-        pretrained_path=pretrained_path
-    )
-    return q
-
-
-
-def create_results_folder(trial_name):
-    """Create a timestamped results folder with subfolders"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    results_folder = f"{trial_name}_{timestamp}"
     
-    base_path = Path(results_folder)
-    base_path.mkdir(exist_ok=True)
+    retain_train_indices = retain_transitions[retain_test_size:]
+    forget_train_indices = forget_transitions[forget_test_size:]
     
-    # Create subfolders
-    (base_path / "csv").mkdir(exist_ok=True)
-    (base_path / "plots").mkdir(exist_ok=True)
+    print(f"Dataset split:")
+    print(f"  Retain train: {len(retain_train_indices)} transitions")
+    print(f"  Forget train: {len(forget_train_indices)} transitions")
+    print(f"  Test (both): {len(test_indices)} transitions")
     
-    return str(base_path)
+    return retain_train_indices, forget_train_indices, test_indices
 
 
-def eval_report(tag, model, test_ds, forget_ds, device, ks=(1, 3, 5, 9)):
-    """Evaluate and return results as dict for logging"""
-    print(f"\n=== {tag} ===")
-    test_metrics = evaluate(model, test_ds, device=device, ks=ks)
-    forget_metrics = evaluate(model, forget_ds, device=device, ks=ks)
-    
-    print("Test:", test_metrics)
-    print("Forget:", forget_metrics)
-    
+def create_dataloaders(
+    dataset: MovieLensDataset,
+    retain_indices: List[int],
+    forget_indices: List[int],
+    test_indices: List[int],
+    batch_size: int = 128
+) -> Dict[str, DataLoader]:
+    """Create dataloaders for all splits."""
     return {
-        "trial": tag,
-        "test": test_metrics,
-        "forget": forget_metrics
+        'retain': DataLoader(Subset(dataset, retain_indices), batch_size=batch_size, shuffle=True),
+        'forget': DataLoader(Subset(dataset, forget_indices), batch_size=batch_size, shuffle=True),
+        'test': DataLoader(Subset(dataset, test_indices), batch_size=batch_size, shuffle=False),
+        'retain+forget': DataLoader(Subset(dataset, retain_indices + forget_indices), batch_size=batch_size, shuffle=True)
     }
 
 
-def flatten_metrics_to_csv_row(trial_name, test_metrics, forget_metrics):
-    """Flatten nested metrics dict into a single CSV row"""
-    row = {"trial": trial_name}
+def train_dqn_epoch(agent: DQNAgent, dataloader: DataLoader, device: str = 'cuda') -> float:
+    """Train DQN for one epoch."""
+    losses = []
     
-    # Flatten test metrics
-    for key, value in test_metrics.items():
-        row[f"test_{key}"] = value
+    for batch in tqdm(dataloader, desc="Training", leave=False):
+        states, actions, rewards, next_states, dones = batch
+        
+        for i in range(len(states)):
+            agent.replay_buffer.push(states[i], actions[i], rewards[i], next_states[i], dones[i])
+        
+        loss = agent.train_step()
+        if loss is not None:
+            losses.append(loss)
     
-    # Flatten forget metrics
-    for key, value in forget_metrics.items():
-        row[f"forget_{key}"] = value
-    
-    return row
+    return np.mean(losses) if losses else 0.0
 
 
-def save_metrics_to_csv(results_folder, metrics_list):
-    """Save all metrics to a CSV file"""
-    df = pd.DataFrame(metrics_list)
-    csv_path = Path(results_folder) / "csv" / "metrics.csv"
-    df.to_csv(csv_path, index=False)
-    print(f"\nMetrics saved to {csv_path}")
-    return csv_path
+def decremental_unlearn(
+    q_network: QNetwork,
+    forget_loader: DataLoader,
+    retain_loader: DataLoader,
+    candidate_items: torch.Tensor,
+    epochs: int = 10,
+    lr: float = 1e-4,
+    lambda_retain: float = 1.0,
+    grad_clip: float = 1.0,
+    device: str = 'cuda'
+) -> QNetwork:
+    """Decremental RL unlearning."""
+    print("\n=== Starting Decremental RL Unlearning ===")
+    
+    q_ref = copy.deepcopy(q_network).to(device)
+    q_ref.eval()
+    for p in q_ref.parameters():
+        p.requires_grad_(False)
+    
+    q_cur = q_network.to(device)
+    q_cur.train()
+    
+    optimizer = torch.optim.Adam(q_cur.parameters(), lr=lr)
+    candidate_items = candidate_items.to(device)
+    num_items = len(candidate_items)
+    
+    retain_iter = iter(retain_loader)
+    
+    for epoch in range(epochs):
+        epoch_losses = []
+        epoch_forget_losses = []
+        epoch_retain_losses = []
+        
+        for batch_idx, forget_batch in enumerate(tqdm(forget_loader, desc=f"Unlearning Epoch {epoch+1}/{epochs}", leave=False)):
+            states_f, actions_f, rewards_f, next_states_f, dones_f = forget_batch
+            states_f = states_f.to(device)
+            B_f = len(states_f)
+            
+            random_indices = torch.randint(0, num_items, (B_f,), device=device)
+            random_items = candidate_items[random_indices]
+            
+            q_forget = q_cur(states_f, random_items)
+            L_forget = q_forget.mean()
+            
+            try:
+                retain_batch = next(retain_iter)
+            except StopIteration:
+                retain_iter = iter(retain_loader)
+                retain_batch = next(retain_iter)
+            
+            states_r, actions_r, rewards_r, next_states_r, dones_r = retain_batch
+            states_r = states_r.to(device)
+            actions_r = actions_r.to(device)
+            
+            q_retain_cur = q_cur(states_r, actions_r)
+            
+            with torch.no_grad():
+                q_retain_ref = q_ref(states_r, actions_r)
+            
+            L_retain = torch.abs(q_retain_cur - q_retain_ref).mean()
+            
+            loss = L_forget + lambda_retain * L_retain
+            
+            optimizer.zero_grad()
+            loss.backward()
+            
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(q_cur.parameters(), grad_clip)
+            
+            optimizer.step()
+            
+            epoch_losses.append(loss.item())
+            epoch_forget_losses.append(L_forget.item())
+            epoch_retain_losses.append(L_retain.item())
+        
+        avg_loss = np.mean(epoch_losses)
+        avg_forget = np.mean(epoch_forget_losses)
+        avg_retain = np.mean(epoch_retain_losses)
+        
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} | L_forget: {avg_forget:.4f} | L_retain: {avg_retain:.4f}")
+    
+    print("=== Unlearning Complete ===\n")
+    return q_cur
 
 
-def create_plots(results_folder, metrics_list):
-    """Create and save comparison plots"""
-    df = pd.DataFrame(metrics_list)
+def main():
+    # Configuration
+    data_path = '../data_movie/'
+    max_users = 1000
+    forget_user_ids = [1, 2, 3, 4, 5]
+    test_ratio = 0.2
+    batch_size = 128
+    train_epochs = 5
+    unlearn_epochs = 1
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    save_dir = 'checkpoints/'
     
-    plots_folder = Path(results_folder) / "plots"
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Extract metrics (assuming NDCG@k, HR@k format)
-    trials = df["trial"].tolist()
-    
-    # Find all metric columns
-    test_cols = [col for col in df.columns if col.startswith("test_")]
-    forget_cols = [col for col in df.columns if col.startswith("forget_")]
-    
-    # Create comparison plots
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle("Model Evaluation Metrics Comparison", fontsize=16, fontweight='bold')
-    
-    # Plot 1: Test metrics across trials
-    if test_cols:
-        ax = axes[0, 0]
-        for col in test_cols[:4]:  # Limit to first 4 metrics
-            ax.plot(trials, df[col], marker='o', label=col)
-        ax.set_title("Test Metrics")
-        ax.set_xlabel("Trial")
-        ax.set_ylabel("Score")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-    
-    # Plot 2: Forget metrics across trials
-    if forget_cols:
-        ax = axes[0, 1]
-        for col in forget_cols[:4]:  # Limit to first 4 metrics
-            ax.plot(trials, df[col], marker='s', label=col)
-        ax.set_title("Forget Metrics")
-        ax.set_xlabel("Trial")
-        ax.set_ylabel("Score")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
-    
-    # Plot 3: Test vs Forget comparison for first metric
-    if test_cols and forget_cols:
-        ax = axes[1, 0]
-        test_metric = test_cols[0]
-        forget_metric = forget_cols[0]
-        x = np.arange(len(trials))
-        width = 0.35
-        ax.bar(x - width/2, df[test_metric], width, label='Test', alpha=0.8)
-        ax.bar(x + width/2, df[forget_metric], width, label='Forget', alpha=0.8)
-        ax.set_title(f"Test vs Forget: {test_metric}")
-        ax.set_xlabel("Trial")
-        ax.set_ylabel("Score")
-        ax.set_xticks(x)
-        ax.set_xticklabels(trials, rotation=45, ha='right')
-        ax.legend()
-        ax.grid(True, alpha=0.3, axis='y')
-    
-    # Plot 4: Summary statistics
-    ax = axes[1, 1]
-    ax.axis('off')
-    
-    summary_text = "Summary Statistics:\n\n"
-    for col in test_cols[:3]:
-        mean_val = df[col].mean()
-        std_val = df[col].std()
-        summary_text += f"{col}:\n  Mean: {mean_val:.4f}, Std: {std_val:.4f}\n"
-    
-    ax.text(0.1, 0.9, summary_text, transform=ax.transAxes, fontsize=10, 
-            verticalalignment='top', family='monospace',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout()
-    plot_path = plots_folder / "metrics_comparison.png"
-    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-    print(f"Plots saved to {plot_path}")
-    plt.close()
-    
-    return plot_path
-
-
-def main(
-    log_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\trainset.csv",
-    item_path = r"E:\Kuliah\Kuliah\Kuliah\PRODI\Semester 7\ProSkripCode\data\raw\item_info.csv",
-    sample_amount = 50,
-    epoch = 2,
-    forget_epoch = 1,
-    lambda_retain = 0.5,
-    ascent_epoch = 1
-        ):
-    EPOCH = epoch
-
-    log_cfg = LogConfig(path=log_path, slate_size=9, max_click_history=50)
-    item_cfg = ItemConfig(path=item_path, item_vec_dim=None)
-
-    df_log = load_log_table(log_cfg).reset_index(drop=True)
-    df_item = load_item_table(item_cfg)
-
-    df_log = df_log.iloc[:sample_amount].reset_index(drop=True)
-
-    df_train, df_forget, df_test = split_df_log_train_forget_test(df_log, 0.6, 0.2, 0.2, seed=42)
-    df_train_forget = pd.concat([df_train, df_forget]).reset_index(drop=True)
-
-    test_ds = make_dataset(df_test, df_item)
-    forget_ds = make_dataset(df_forget, df_item)
-    train_ds = make_dataset(df_train, df_item)
-
-    # Loader untuk forget (dipakai saat decremental/unlearning)
-    forget_loader = DataLoader(
-        forget_ds,
-        batch_size=256,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
+    # Load dataset
+    print("Loading dataset...")
+    dataset = MovieLensDataset(
+        data_path=data_path,
+        min_interactions=20,
+        max_users=max_users,
+        use_genome=False,
+        seed=42
     )
-
-    retain_loader = DataLoader(
-        train_ds,
-        batch_size=256,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    cfg = TrainConfig(
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        lr=1e-3,
-        gamma=0.99,
-        batch_size=256,
-        num_epochs=EPOCH,
-        target_update="hard",
-        hard_update_interval=500,
-        save_dir="weights",
-        save_name="dqn_basic.pt"
-    )
-
-    # Create results folder
-    results_folder = create_results_folder("RL4RS_Unlearning")
-    print(f"\n{'='*60}")
-    print(f"Results will be saved to: {results_folder}")
-    print(f"{'='*60}")
+    
+    retain_indices, forget_indices, test_indices = split_dataset(dataset, forget_user_ids, test_ratio)
+    loaders = create_dataloaders(dataset, retain_indices, forget_indices, test_indices, batch_size)
+    candidate_items = dataset.get_all_candidate_actions()
     
     # Store all results
-    all_metrics = []
-
-    # A: untrained baseline (optional)
-    # try:
-    #     cfg_A = TrainConfig(
-    #         device=cfg.device, lr=cfg.lr, gamma=cfg.gamma, batch_size=cfg.batch_size,
-    #         num_epochs=0,
-    #         target_update=cfg.target_update, hard_update_interval=cfg.hard_update_interval,
-    #         save_dir=cfg.save_dir, save_name="dqn_untrained.pt"
-    #     )
-    #     q_A = train_on(df_train, df_item, cfg_A)
-    #     eval_report("A (untrained)", q_A, test_ds, forget_ds, cfg.device)
-    # except Exception as e:
-    #     print("\n(A untrained diskip) train_dqn_basic tidak support num_epochs=0:", repr(e))
-
-    # B: trained on retain only (basic)
-    q_B = train_on(df_train, df_item, cfg)
-    metrics_B = eval_report("A (trained on retain)", q_B, test_ds, forget_ds, cfg.device)
-    all_metrics.append(flatten_metrics_to_csv_row(metrics_B["trial"], metrics_B["test"], metrics_B["forget"]))
-
-    # B_alt: trained on retain + forget (basic)
-    cfg.save_name = "dqn_basic_retain_forget.pt"
-    q_B_rf = train_on(df_train_forget, df_item, cfg)
-    metrics_B_rf = eval_report("B (trained on retain+forget)", q_B_rf, test_ds, forget_ds, cfg.device)
-    all_metrics.append(flatten_metrics_to_csv_row(metrics_B_rf["trial"], metrics_B_rf["test"], metrics_B_rf["forget"]))
-
-    # C: trained + decremental RL unlearning on forget
-    cfg_C = TrainConfig(
-        device=cfg.device,
-        lr=cfg.lr,
-        gamma=cfg.gamma,
-        batch_size=cfg.batch_size,
-        num_epochs=cfg.num_epochs,
-        target_update=cfg.target_update,
-        hard_update_interval=cfg.hard_update_interval,
-        save_dir=cfg.save_dir,
-        save_name="dqn_basic_then_dec.pt"
-    )
-
-    # --- aktifkan decremental ---
-    cfg_C.do_decremental = True
-    cfg_C.dec_epochs = forget_epoch
-    cfg_C.dec_lr = 1e-3
-    cfg_C.dec_alpha = lambda_retain
-    cfg_C.dec_save_name = "dqn_decremental.pt"
-
-    q_C = train_on(df_train_forget, df_item, cfg_C, forget_loader=forget_loader, retain_loader=retain_loader, do_base_train=False, pretrained_path="weights/dqn_basic_retain_forget.pt")
-    metrics_C = eval_report("C (basic + decremental)", q_C, test_ds, forget_ds, cfg.device)
-    all_metrics.append(flatten_metrics_to_csv_row(metrics_C["trial"], metrics_C["test"], metrics_C["forget"]))
-
-    # D: Learn with retain and forget, then gradient ascent on forget
-    cfg_D = TrainConfig(
-        device=cfg.device,
-        lr=cfg.lr,
-        gamma=cfg.gamma,
-        batch_size=cfg.batch_size,
-        num_epochs=cfg.num_epochs,
-        target_update=cfg.target_update,
-        hard_update_interval=cfg.hard_update_interval,
-        save_dir=cfg.save_dir,
-        save_name="dqn_basic_then_dec.pt",
-    )
-
-    cfg_D.do_ascent = True
-    cfg_D.asc_epochs = ascent_epoch
-
-    q_D = train_on(
-        df_train_forget,
-        df_item,
-        cfg_D,
-        forget_loader=forget_loader,
-        do_base_train=False,                # <--- skip base training
-        pretrained_path="weights/dqn_basic_retain_forget.pt",     # <--- start from B
-    )
-    metrics_D = eval_report("D (retain+forget + ascent)", q_D, test_ds, forget_ds, cfg.device)
-    all_metrics.append(flatten_metrics_to_csv_row(metrics_D["trial"], metrics_D["test"], metrics_D["forget"]))
-
-    # Save metrics to CSV
-    save_metrics_to_csv(results_folder, all_metrics)
+    all_results = {}
     
-    # Create and save plots
-    create_plots(results_folder, all_metrics)
+    # ============================================
+    # PHASE 1: BASELINE
+    # ============================================
+    print("\n" + "="*60)
+    print("PHASE 1: BASELINE (Retain only)")
+    print("="*60)
+    
+    agent_baseline = DQNAgent(
+        state_dim=100,
+        action_dim=dataset.action_dim,
+        hidden_dim=256,
+        learning_rate=1e-4,
+        gamma=0.99,
+        device=device
+    )
+    
+    for epoch in range(train_epochs):
+        loss = train_dqn_epoch(agent_baseline, loaders['retain'], device)
+        print(f"Epoch {epoch+1}/{train_epochs} - Loss: {loss:.4f}")
+    
+    test_baseline = evaluate_recommender(agent_baseline.q_network, loaders['test'], candidate_items, device)
+    forget_baseline = evaluate_recommender(agent_baseline.q_network, loaders['forget'], candidate_items, device)
+    print_evaluation_results("BASELINE", test_baseline, forget_baseline)
+    
+    agent_baseline.save(os.path.join(save_dir, 'baseline.pt'))
+    all_results['baseline'] = {'test': test_baseline, 'forget': forget_baseline}
+    
+    # ============================================
+    # PHASE 2: AFTER LEARNING
+    # ============================================
+    print("\n" + "="*60)
+    print("PHASE 2: AFTER LEARNING (Retain + Forget)")
+    print("="*60)
+    
+    agent_learned = DQNAgent(
+        state_dim=100,
+        action_dim=dataset.action_dim,
+        hidden_dim=256,
+        learning_rate=1e-4,
+        gamma=0.99,
+        device=device
+    )
+    
+    for epoch in range(train_epochs):
+        loss = train_dqn_epoch(agent_learned, loaders['retain+forget'], device)
+        print(f"Epoch {epoch+1}/{train_epochs} - Loss: {loss:.4f}")
+    
+    test_learned = evaluate_recommender(agent_learned.q_network, loaders['test'], candidate_items, device)
+    forget_learned = evaluate_recommender(agent_learned.q_network, loaders['forget'], candidate_items, device)
+    print_evaluation_results("AFTER LEARNING", test_learned, forget_learned)
+    
+    agent_learned.save(os.path.join(save_dir, 'after_learning.pt'))
+    all_results['after_learning'] = {'test': test_learned, 'forget': forget_learned}
+    
+    # ============================================
+    # PHASE 3: AFTER UNLEARNING
+    # ============================================
+    print("\n" + "="*60)
+    print("PHASE 3: AFTER UNLEARNING (Decremental RL)")
+    print("="*60)
+    
+    q_unlearned = decremental_unlearn(
+        q_network=agent_learned.q_network,
+        forget_loader=loaders['forget'],
+        retain_loader=loaders['retain'],
+        candidate_items=candidate_items,
+        epochs=unlearn_epochs,
+        lr=1e-4,
+        lambda_retain=1.0,
+        device=device
+    )
+    
+    test_unlearned = evaluate_recommender(q_unlearned, loaders['test'], candidate_items, device)
+    forget_unlearned = evaluate_recommender(q_unlearned, loaders['forget'], candidate_items, device)
+    print_evaluation_results("AFTER UNLEARNING", test_unlearned, forget_unlearned)
+    
+    torch.save(q_unlearned.state_dict(), os.path.join(save_dir, 'after_unlearning.pt'))
+    all_results['after_unlearning'] = {'test': test_unlearned, 'forget': forget_unlearned}
+    
+    # ============================================
+    # SUMMARY
+    # ============================================
+    summary = compute_unlearning_summary(
+        test_baseline, test_learned, test_unlearned,
+        forget_baseline, forget_learned, forget_unlearned
+    )
+    print_unlearning_summary(summary)
+    
+    # Save all results
+    with open(os.path.join(save_dir, 'results.json'), 'w') as f:
+        json.dump({
+            'baseline': all_results['baseline'],
+            'after_learning': all_results['after_learning'],
+            'after_unlearning': all_results['after_unlearning'],
+            'summary': summary
+        }, f, indent=2)
     
     print(f"\n{'='*60}")
-    print(f"All results saved to: {results_folder}")
-    print(f"  - CSV: {results_folder}/csv/metrics.csv")
-    print(f"  - Plots: {results_folder}/plots/metrics_comparison.png")
+    print("TRAINING COMPLETE!")
+    print(f"Results saved to {save_dir}")
     print(f"{'='*60}")
 
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

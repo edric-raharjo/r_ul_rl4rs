@@ -1,101 +1,216 @@
-import numpy as np
+# eval/evaluate.py
 import torch
 from torch.utils.data import DataLoader
+from typing import Dict, List, Tuple
+from model.dqn_model import QNetwork
+from eval.metrics import RecommenderMetrics, UnlearningMetrics
+from tqdm import tqdm
 
 
-def _dcg_at_k(rels_sorted, k: int):
+def evaluate_recommender(
+    q_network: QNetwork,
+    dataloader: DataLoader,
+    candidate_items: torch.Tensor,
+    device: str = 'cuda',
+    k_values: List[int] = [5, 10, 20]
+) -> Dict[str, float]:
     """
-    rels_sorted: [B,K] relevance already ordered by rank (rank 1..K).
-    DCG@k = sum_{i=1..k} rel_i / log2(i+1)
+    Comprehensive evaluation of recommender system.
+    
+    Args:
+        q_network: Q-network to evaluate
+        dataloader: DataLoader with test data
+        candidate_items: All candidate item features [num_items, action_dim]
+        device: Device
+        k_values: List of K values for top-K metrics
+    
+    Returns:
+        Dictionary of metrics
     """
-    device = rels_sorted.device
-    k = min(k, rels_sorted.shape[1])
-    rels_k = rels_sorted[:, :k]
-    discounts = torch.log2(torch.arange(2, k + 2, device=device).float())  # [k], 2..k+1
-    return (rels_k / discounts.unsqueeze(0)).sum(dim=1)  # [B]
+    q_network.eval()
+    candidate_items = candidate_items.to(device)
+    num_items = len(candidate_items)
+    
+    all_q_pred = []
+    all_rewards = []
+    all_target_indices = []
+    all_q_values_all_items = []
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            states, actions, rewards, next_states, dones = batch
+            states = states.to(device)
+            actions = actions.to(device)
+            rewards = rewards.to(device)
+            
+            batch_size = len(states)
+            
+            # Q-values for actual actions
+            q_pred = q_network(states, actions)
+            all_q_pred.append(q_pred.cpu())
+            all_rewards.append(rewards.cpu())
+            
+            # Q-values for all candidate items (for ranking metrics)
+            q_all_items = []
+            for i in range(batch_size):
+                state_i = states[i:i+1].expand(num_items, -1)  # [num_items, state_dim]
+                q_vals = q_network(state_i, candidate_items)  # [num_items]
+                q_all_items.append(q_vals)
+            
+            q_all_items = torch.stack(q_all_items, dim=0)  # [batch_size, num_items]
+            all_q_values_all_items.append(q_all_items.cpu())
+            
+            # Find target item indices (which item was actually chosen)
+            # Match action features to candidate_items to find index
+            target_idx = []
+            for i in range(batch_size):
+                action_i = actions[i]
+                # Find matching candidate (assuming first feature is item_idx)
+                item_idx_in_action = int(action_i[0].item())
+                target_idx.append(item_idx_in_action)
+            all_target_indices.append(torch.tensor(target_idx))
+    
+    # Concatenate all batches
+    all_q_pred = torch.cat(all_q_pred, dim=0)
+    all_rewards = torch.cat(all_rewards, dim=0)
+    all_q_values_all_items = torch.cat(all_q_values_all_items, dim=0)
+    all_target_indices = torch.cat(all_target_indices, dim=0)
+    
+    # Compute metrics
+    metrics = RecommenderMetrics()
+    results = {
+        'mse': metrics.q_value_mse(all_q_pred, all_rewards),
+        'mae': metrics.q_value_mae(all_q_pred, all_rewards),
+        'mrr': metrics.mrr(all_q_values_all_items, all_target_indices)
+    }
+    
+    # Top-K metrics
+    for k in k_values:
+        results[f'hit_rate@{k}'] = metrics.hit_rate(all_q_values_all_items, all_target_indices, k)
+        results[f'ndcg@{k}'] = metrics.ndcg_at_k(all_q_values_all_items, all_target_indices, k)
+        results[f'precision@{k}'] = metrics.precision_at_k(all_q_values_all_items, all_target_indices, k)
+    
+    q_network.train()
+    return results
 
 
-def _ndcg_at_k_from_labels(labels, rank_idx, k: int):
+def evaluate_unlearning(
+    results_baseline: Dict[str, float],
+    results_after_learning: Dict[str, float],
+    results_after_unlearning: Dict[str, float],
+    metric_name: str = 'hit_rate@10'
+) -> Dict[str, float]:
     """
-    labels: [B,K] (0/1)
-    rank_idx: [B,K] indices of candidates in descending score order
+    Evaluate unlearning effectiveness.
+    
+    Args:
+        results_baseline: Metrics on forget set from baseline model (trained on retain only)
+        results_after_learning: Metrics on forget set after learning on forget data
+        results_after_unlearning: Metrics on forget set after unlearning
+        metric_name: Primary metric to use for evaluation
+    
+    Returns:
+        Dictionary with unlearning-specific metrics
     """
-    # relevance in the model's ranked order
-    rel_sorted = torch.gather(labels, dim=1, index=rank_idx)  # [B,K]
+    unlearn_metrics = UnlearningMetrics()
+    
+    # Forget quality: how much did performance drop on forget set?
+    forget_quality = unlearn_metrics.forget_quality(
+        forget_performance_after=results_after_unlearning[metric_name],
+        forget_performance_before=results_after_learning[metric_name]
+    )
+    
+    # Model utility is computed on retain set (passed separately)
+    # This function just returns forget quality
+    return {
+        'forget_quality': forget_quality,
+        'forget_performance_baseline': results_baseline[metric_name],
+        'forget_performance_learned': results_after_learning[metric_name],
+        'forget_performance_unlearned': results_after_unlearning[metric_name]
+    }
 
-    dcg = _dcg_at_k(rel_sorted, k)  # [B]
 
-    # ideal ranking: sort labels descending (positives first)
-    ideal_idx = torch.argsort(labels, dim=1, descending=True)
-    ideal_sorted = torch.gather(labels, dim=1, index=ideal_idx)
-    idcg = _dcg_at_k(ideal_sorted, k)  # [B]
-
-    # if no positives at all -> idcg=0; exclude from mean
-    valid = idcg > 0
-    ndcg = torch.zeros_like(dcg)
-    ndcg[valid] = dcg[valid] / idcg[valid]
-    return ndcg, valid
-
-
-@torch.no_grad()
-def evaluate_hit_ndcg_at_k(model, dataset, ks=(1, 3, 5, 9), device="cuda", batch_size=512):
+def print_evaluation_results(
+    phase_name: str,
+    test_results: Dict[str, float],
+    forget_results: Dict[str, float]
+):
     """
-    Returns a dict of metrics: hit@k and ndcg@k.
-    - hit@k: 1 if any label=1 in top-k, else 0 (averaged).
-    - ndcg@k: normalized DCG (averaged) over samples with >=1 positive.
+    Pretty print evaluation results.
+    
+    Args:
+        phase_name: Name of the phase (e.g., "Baseline", "After Learning")
+        test_results: Metrics on test set
+        forget_results: Metrics on forget set
     """
-    model.eval().to(device)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=2, pin_memory=True)
-
-    ks = sorted(list(ks))
-    hits_sum = {k: 0.0 for k in ks}
-    ndcg_sum = {k: 0.0 for k in ks}
-    n_total = 0
-    n_valid_ndcg = {k: 0 for k in ks}
-
-    for batch in loader:
-        state = batch["state"].to(device)                                   # [B, state_dim]
-        cand_ids = batch["next_candidate_ids"].to(device).long()           # [B,K]
-        cand_mask = batch["next_candidate_mask"].to(device).bool()         # [B,K]
-        labels = batch["next_candidate_labels"].to(device).float()         # [B,K]
-
-        # Q-values for candidates using catalog network
-        q = model.q_values_for_candidates(
-            state=state,
-            candidate_ids=cand_ids,
-            candidate_mask=cand_mask,
-        )                                                                   # [B,K]
-
-        # Ensure masked items cannot be chosen
-        q = q.masked_fill(~cand_mask, float("-inf"))
-
-        # Ranking indices (descending Q)
-        rank_idx = torch.argsort(q, dim=1, descending=True)                # [B,K]
-
-        B, K = labels.shape
-        n_total += B
-
-        # Hit@K
-        labels_ranked = torch.gather(labels, 1, rank_idx)                  # [B,K]
-        for k in ks:
-            k2 = min(k, K)
-            hit = (labels_ranked[:, :k2].sum(dim=1) > 0).float()           # [B]
-            hits_sum[k] += hit.sum().item()
-
-        # NDCG@K (only for samples with at least one positive)
-        for k in ks:
-            ndcg, valid = _ndcg_at_k_from_labels(labels, rank_idx, k)
-            ndcg_sum[k] += ndcg[valid].sum().item()
-            n_valid_ndcg[k] += int(valid.sum().item())
-
-    out = {"num_steps": float(n_total)}
-    for k in ks:
-        out[f"hit@{k}"] = hits_sum[k] / max(n_total, 1)
-        out[f"ndcg@{k}"] = ndcg_sum[k] / max(n_valid_ndcg[k], 1)
-        out[f"ndcg@{k}_num_valid"] = float(n_valid_ndcg[k])
-    return out
+    print(f"\n{'='*60}")
+    print(f"{phase_name} - Evaluation Results")
+    print(f"{'='*60}")
+    
+    print("\n--- Test Set ---")
+    for metric, value in test_results.items():
+        print(f"  {metric:20s}: {value:.4f}")
+    
+    print("\n--- Forget Set ---")
+    for metric, value in forget_results.items():
+        print(f"  {metric:20s}: {value:.4f}")
+    
+    print(f"{'='*60}\n")
 
 
-def evaluate(model, dataset, device="cuda", ks=(1, 3, 5, 9), batch_size=512):
-    return evaluate_hit_ndcg_at_k(model, dataset, ks=ks, device=device, batch_size=batch_size)
+def compute_unlearning_summary(
+    test_baseline: Dict[str, float],
+    test_learned: Dict[str, float],
+    test_unlearned: Dict[str, float],
+    forget_baseline: Dict[str, float],
+    forget_learned: Dict[str, float],
+    forget_unlearned: Dict[str, float],
+    primary_metric: str = 'hit_rate@10'
+) -> Dict[str, float]:
+    """
+    Compute comprehensive unlearning summary metrics.
+    
+    Returns:
+        Summary dictionary with key unlearning metrics
+    """
+    unlearn_metrics = UnlearningMetrics()
+    
+    # Forget quality
+    forget_quality = unlearn_metrics.forget_quality(
+        forget_performance_after=forget_unlearned[primary_metric],
+        forget_performance_before=forget_learned[primary_metric]
+    )
+    
+    # Model utility (on test set)
+    model_utility = unlearn_metrics.model_utility(
+        retain_performance_after=test_unlearned[primary_metric],
+        retain_performance_baseline=test_baseline[primary_metric]
+    )
+    
+    # Overall efficacy
+    efficacy = unlearn_metrics.unlearning_efficacy(forget_quality, model_utility)
+    
+    summary = {
+        'forget_quality': forget_quality,
+        'model_utility': model_utility,
+        'unlearning_efficacy': efficacy,
+        f'test_{primary_metric}_baseline': test_baseline[primary_metric],
+        f'test_{primary_metric}_learned': test_learned[primary_metric],
+        f'test_{primary_metric}_unlearned': test_unlearned[primary_metric],
+        f'forget_{primary_metric}_baseline': forget_baseline[primary_metric],
+        f'forget_{primary_metric}_learned': forget_learned[primary_metric],
+        f'forget_{primary_metric}_unlearned': forget_unlearned[primary_metric]
+    }
+    
+    return summary
+
+
+def print_unlearning_summary(summary: Dict[str, float]):
+    """Pretty print unlearning summary."""
+    print(f"\n{'='*60}")
+    print("UNLEARNING SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Forget Quality:       {summary['forget_quality']:.4f}  (higher = better forgetting)")
+    print(f"  Model Utility:        {summary['model_utility']:.4f}  (higher = better retention)")
+    print(f"  Unlearning Efficacy:  {summary['unlearning_efficacy']:.4f}  (harmonic mean)")
+    print(f"{'='*60}\n")
